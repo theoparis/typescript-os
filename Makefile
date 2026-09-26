@@ -63,7 +63,7 @@ $(BUILD_DIR)/embed.o: embed.s $(USER_ELF) | $(BUILD_DIR)
 
 $(CONFIG_TS): FORCE | $(BUILD_DIR)
 	@echo "// Auto-generated configuration" > $@.tmp; \
-	echo "export const CONFIG_USE_16K: boolean = $(CONFIG_PAGE_SIZE_16K);" >> $@.tmp; \
+	echo "export const use_16k: boolean = $(CONFIG_PAGE_SIZE_16K);" >> $@.tmp; \
 	if ! cmp -s $@.tmp $@ 2>/dev/null; then \
 		mv $@.tmp $@; \
 	else \
