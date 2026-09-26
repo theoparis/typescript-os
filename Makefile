@@ -81,11 +81,27 @@ $(STAGE3_TAR): | $(BUILD_DIR)
 $(ROOTFS_IMG): $(STAGE3_TAR) | $(BUILD_DIR)
 	rm -rf $(ROOTFS_DIR)
 	mkdir -p $(ROOTFS_DIR)/usr/lib $(ROOTFS_DIR)/usr/bin $(ROOTFS_DIR)/etc
-	tar -xf $(STAGE3_TAR) -C $(ROOTFS_DIR) ./usr/lib/libc.so ./usr/bin/echo ./usr/bin/cat ./usr/bin/uname ./usr/bin/pwd 2>/dev/null || true
+	tar -xf $(STAGE3_TAR) -C $(ROOTFS_DIR) \
+		./usr/lib/libc.so \
+		./usr/lib/libreadline.so.8.3 \
+		./usr/lib/libtinfow.so.6.5 \
+		./usr/lib/libncursesw.so.6.5 \
+		./usr/bin/bash \
+		./usr/bin/echo \
+		./usr/bin/cat \
+		./usr/bin/uname \
+		./usr/bin/pwd 2>/dev/null || true
 	ln -sf usr/lib $(ROOTFS_DIR)/lib
 	ln -sf usr/bin $(ROOTFS_DIR)/bin
 	ln -sf usr/bin $(ROOTFS_DIR)/sbin
 	ln -sf libc.so $(ROOTFS_DIR)/usr/lib/ld-musl-aarch64.so.1
+	ln -sf libreadline.so.8.3 $(ROOTFS_DIR)/usr/lib/libreadline.so.8
+	ln -sf libreadline.so.8 $(ROOTFS_DIR)/usr/lib/libreadline.so
+	ln -sf libtinfow.so.6.5 $(ROOTFS_DIR)/usr/lib/libtinfow.so.6
+	ln -sf libtinfow.so.6 $(ROOTFS_DIR)/usr/lib/libtinfow.so
+	ln -sf libncursesw.so.6.5 $(ROOTFS_DIR)/usr/lib/libncursesw.so.6
+	ln -sf libncursesw.so.6 $(ROOTFS_DIR)/usr/lib/libncursesw.so
+	ln -sf bash $(ROOTFS_DIR)/usr/bin/sh
 	echo 'NAME="tsos"' > $(ROOTFS_DIR)/etc/os-release
 	echo 'Hello from Gentoo musl rootfs in tsos!' > $(ROOTFS_DIR)/hello.txt
 	mke2fs -q -F -t ext2 -d $(ROOTFS_DIR) $@ 32M

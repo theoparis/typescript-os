@@ -4,9 +4,9 @@ import {
     poke8,
     peek64,
     poke64,
-    print,
     printHex64,
     putchar,
+    has_char,
 } from "./uart.ts";
 import { alloc_page, map_user_page } from "./mmu.ts";
 import {
@@ -17,6 +17,8 @@ import {
     vfs_lseek,
     vfs_fstat,
     vfs_stat,
+    vfs_dup,
+    vfs_dup2,
 } from "./vfs.ts";
 
 export type TrapFrame = {
@@ -63,6 +65,7 @@ let user_process_exit_code: u64 = 0n;
 let current_brk: bigint = 0x0000000021000000n;
 let next_user_mmap: bigint = 0x0000000022000000n;
 let scratch_path_buf: bigint = 0n;
+let scratch_stat_buf: bigint = 0n;
 
 function copy_string_to_user(dst_addr: bigint, src_str: string): void {
     const src = <Ref<u8>>(<Opaque>src_str);
@@ -86,6 +89,7 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
 
     if (scratch_path_buf === 0n) {
         scratch_path_buf = alloc_page();
+        scratch_stat_buf = alloc_page();
     }
 
     if (syscall_nr === 64n) {
@@ -140,6 +144,27 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
     } else if (syscall_nr === 96n) {
         // sys_set_tid_address(int *tidptr)
         frame.x0 = 1n; // tid = 1
+    } else if (syscall_nr === 17n) {
+        // sys_getcwd(char *buf, size_t size)
+        const buf = frame.x0;
+        copy_string_to_user(buf, "/");
+        frame.x0 = buf; // returns pointer to buf
+    } else if (syscall_nr === 48n || syscall_nr === 439n) {
+        // sys_faccessat / sys_faccessat2
+        const path_ptr = frame.x1;
+        let p_idx: u64 = 0n;
+        while (true) {
+            const ch = peek8(path_ptr + p_idx);
+            poke8(scratch_path_buf + p_idx, ch);
+            if (ch === (0 as u8)) break;
+            p_idx = p_idx + 1n;
+        }
+        const path_str = <string>(<Opaque>scratch_path_buf);
+        const exists = vfs_stat(path_str, scratch_stat_buf) === 0;
+        frame.x0 = exists ? 0n : (-2n as u64); // 0 = success, -ENOENT = -2
+    } else if (syscall_nr === 205n) {
+        // sys_getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen)
+        frame.x0 = -88n as u64; // -ENOTSOCK
     } else if (syscall_nr === 214n) {
         // sys_brk(unsigned long brk)
         const req_brk = frame.x0;
@@ -181,6 +206,9 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
 
         for (let v = va_start; v < va_end; v = v + 4096n) {
             const phys = alloc_page();
+            for (let i = 0n; i < 512n; i = i + 1n) {
+                poke64(phys + i * 8n, 0n);
+            }
             if (!is_anon && (fd as number) >= 0) {
                 const file_off = offset + (v - va_start);
                 vfs_pread(fd as number, phys, 4096n, file_off);
@@ -193,8 +221,46 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
         // sys_mprotect(void *addr, size_t len, int prot)
         frame.x0 = 0n; // success
     } else if (syscall_nr === 29n) {
-        // sys_ioctl(int fd, unsigned long req, ...)
-        frame.x0 = -25n as u64; // -ENOTTY
+        // sys_ioctl(int fd, unsigned long req, void *arg)
+        const fd = frame.x0;
+        const req = frame.x1;
+        const arg = frame.x2;
+
+        if (req === 0x5401n) {
+            // TCGETS (termios): reports standard terminal attributes so isatty() succeeds!
+            if (arg !== 0n) {
+                for (let i = 0n; i < 48n; i = i + 1n) poke8(arg + i, 0 as u8);
+                poke32(arg + 0n, 0x4500 as u32); // c_iflag
+                poke32(arg + 4n, 0x0005 as u32); // c_oflag
+                poke32(arg + 8n, 0x00bf as u32); // c_cflag
+                poke32(arg + 12n, 0x8a3b as u32); // c_lflag
+            }
+            frame.x0 = 0n;
+        } else if (req === 0x5402n || req === 0x5403n || req === 0x5404n) {
+            // TCSETS, TCSETSW, TCSETSF
+            frame.x0 = 0n;
+        } else if (req === 0x5413n) {
+            // TIOCGWINSZ
+            if (arg !== 0n) {
+                poke16(arg + 0n, 24 as u16); // 24 rows
+                poke16(arg + 2n, 80 as u16); // 80 cols
+                poke16(arg + 4n, 0 as u16);
+                poke16(arg + 6n, 0 as u16);
+            }
+            frame.x0 = 0n;
+        } else if (req === 0x5414n) {
+            // TIOCSWINSZ
+            frame.x0 = 0n;
+        } else if (req === 0x540fn) {
+            // TIOCGPGRP
+            if (arg !== 0n) poke32(arg, 1 as u32);
+            frame.x0 = 0n;
+        } else if (req === 0x5410n) {
+            // TIOCSPGRP
+            frame.x0 = 0n;
+        } else {
+            frame.x0 = -25n as u64; // -ENOTTY
+        }
     } else if (syscall_nr === 56n) {
         // sys_openat(int dirfd, const char *pathname, int flags, mode_t mode)
         const path_ptr = frame.x1;
@@ -256,6 +322,54 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
     } else if (syscall_nr === 78n) {
         // sys_readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz)
         frame.x0 = -22n as u64; // -EINVAL
+    } else if (syscall_nr === 23n) {
+        // sys_dup(int oldfd)
+        const oldfd = frame.x0;
+        const newfd = vfs_dup(oldfd as number);
+        frame.x0 = newfd as u64;
+    } else if (syscall_nr === 24n) {
+        // sys_dup3(int oldfd, int newfd, int flags)
+        const oldfd = frame.x0;
+        const newfd = frame.x1;
+        const res = vfs_dup2(oldfd as number, newfd as number);
+        frame.x0 = res as u64;
+    } else if (syscall_nr === 72n || syscall_nr === 73n) {
+        // sys_pselect6 / sys_ppoll
+        // If monitoring readfds for stdin: poll until character is ready!
+        if (frame.x1 !== 0n) {
+            while (!has_char()) {
+            }
+            frame.x0 = 1n; // 1 ready descriptor
+        } else {
+            frame.x0 = 0n;
+        }
+    } else if (syscall_nr === 154n) {
+        // sys_setpgid(pid_t pid, pid_t pgid)
+        frame.x0 = 0n;
+    } else if (syscall_nr === 25n) {
+        // sys_fcntl(int fd, int cmd, unsigned long arg)
+        frame.x0 = 0n;
+    } else if (syscall_nr === 113n) {
+        // sys_clock_gettime(clockid_t which_clock, struct timespec *tp)
+        const tp = frame.x1;
+        poke64(tp + 0n, 1700000000n); // tv_sec
+        poke64(tp + 8n, 0n);          // tv_nsec
+        frame.x0 = 0n;
+    } else if (syscall_nr === 148n) {
+        // sys_getresuid(uid_t *ruid, uid_t *euid, uid_t *suid)
+        if (frame.x0 !== 0n) poke32(frame.x0, 0 as u32);
+        if (frame.x1 !== 0n) poke32(frame.x1, 0 as u32);
+        if (frame.x2 !== 0n) poke32(frame.x2, 0 as u32);
+        frame.x0 = 0n;
+    } else if (syscall_nr === 150n) {
+        // sys_getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid)
+        if (frame.x0 !== 0n) poke32(frame.x0, 0 as u32);
+        if (frame.x1 !== 0n) poke32(frame.x1, 0 as u32);
+        if (frame.x2 !== 0n) poke32(frame.x2, 0 as u32);
+        frame.x0 = 0n;
+    } else if (syscall_nr === 155n || syscall_nr === 173n) {
+        // sys_getpgid / sys_getppid
+        frame.x0 = 1n;
     } else if (syscall_nr === 134n || syscall_nr === 135n) {
         // sys_rt_sigaction / sys_rt_sigprocmask
         frame.x0 = 0n; // success

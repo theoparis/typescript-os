@@ -58,6 +58,16 @@ function udiv64(n: u64, d: u64): u64 {
 function putchar(c: u8): void {
     poke8(UART_BASE, c);
 }
+function has_char(): boolean {
+    return (peek32(UART_BASE + 0x18n) & (0x10 as u32)) === (0 as u32);
+}
+
+function getchar(): u8 {
+    while (!has_char()) {
+    }
+    return peek8(UART_BASE + 0x00n);
+}
+
 
 function print(s: string): void {
     const p = <Ref<u8>>(<Opaque>s);

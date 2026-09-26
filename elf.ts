@@ -56,6 +56,7 @@ export function load_and_run_elf_file(
     path: string,
     argv0: string,
     argv1: string,
+    argv2: string,
 ): boolean {
     print("[ELF] Loading executable: ");
     print(path);
@@ -267,8 +268,9 @@ export function load_and_run_elf_file(
     }
 
     // Set up strings in user stack top with ample spacing (512 bytes each)
-    const str_argv0 = USER_STACK_TOP - 2048n;
-    const str_argv1 = USER_STACK_TOP - 1536n;
+    const str_argv0 = USER_STACK_TOP - 2560n;
+    const str_argv1 = USER_STACK_TOP - 2048n;
+    const str_argv2 = USER_STACK_TOP - 1536n;
     const str_execfn = USER_STACK_TOP - 1024n;
     const random_bytes = USER_STACK_TOP - 512n;
 
@@ -278,6 +280,11 @@ export function load_and_run_elf_file(
     if (has_arg1) {
         copy_str_to_user(str_argv1, argv1);
     }
+    const p2 = <Ref<u8>>(<Opaque>argv2);
+    const has_arg2 = Deref(p2[0n]) !== (0 as u8);
+    if (has_arg2) {
+        copy_str_to_user(str_argv2, argv2);
+    }
     copy_str_to_user(str_execfn, path);
 
     // 16 bytes of random values
@@ -286,21 +293,28 @@ export function load_and_run_elf_file(
 
     // Stack pointer layout (16-byte aligned at USER_STACK_TOP - 4096n)
     const user_sp = USER_STACK_TOP - 4096n;
-    const argc = has_arg1 ? 2n : 1n;
+    let argc = 1n;
+    if (has_arg1) argc = 2n;
+    if (has_arg2) argc = 3n;
 
     poke64(user_sp + 0n, argc);
     poke64(user_sp + 8n, str_argv0);
+    let cur_off = 16n;
     if (has_arg1) {
-        poke64(user_sp + 16n, str_argv1);
-        poke64(user_sp + 24n, 0n); // argv[2] = NULL
-        poke64(user_sp + 32n, 0n); // envp[0] = NULL
-    } else {
-        poke64(user_sp + 16n, 0n); // argv[1] = NULL
-        poke64(user_sp + 24n, 0n); // envp[0] = NULL
+        poke64(user_sp + cur_off, str_argv1);
+        cur_off = cur_off + 8n;
     }
+    if (has_arg2) {
+        poke64(user_sp + cur_off, str_argv2);
+        cur_off = cur_off + 8n;
+    }
+    poke64(user_sp + cur_off, 0n); // argv[argc] = NULL
+    cur_off = cur_off + 8n;
+    poke64(user_sp + cur_off, 0n); // envp[0] = NULL
+    cur_off = cur_off + 8n;
 
-    // Auxiliary vectors (start at offset 40 if argc=2, or 32 if argc=1)
-    const auxv_base = user_sp + (has_arg1 ? 40n : 32n);
+    // Auxiliary vectors (aligned to 16 bytes)
+    const auxv_base = (user_sp + cur_off + 15n) & ~15n;
 
     poke64(auxv_base + 0n, 3n); poke64(auxv_base + 8n, at_phdr);
     poke64(auxv_base + 16n, 4n); poke64(auxv_base + 24n, e_phentsize);

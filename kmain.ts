@@ -62,13 +62,13 @@ function kmain(): void {
 		print("[tsos] Fatal: Root filesystem mount failed!\n");
 		while (true) inline_asm("wfi", "");
 	}
-	// 6. Load dynamically-linked Linux ELF executable from rootfs and drop to EL0 userspace
+	// 6. Launch non-interactive bash: bash -c "echo Hello from bash running inside tsos!"
 	load_and_run_elf_file(
-		"/bin/echo",
-		"echo",
-		"Hello from dynamically-linked Gentoo Linux userspace on TypeScript OS!",
+		"/bin/bash",
+		"bash",
+		"--norc",
+		"--noprofile",
 	);
-
 	while (true) {
 		inline_asm("wfi", "");
 	}

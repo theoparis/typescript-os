@@ -11,6 +11,7 @@ import {
     print,
     printHex64,
     putchar,
+    getchar,
     udiv64,
 } from "./uart.ts";
 import { alloc_page } from "./mmu.ts";
@@ -146,6 +147,59 @@ export function vfs_close(fd: number): number {
 }
 
 /**
+ * Duplicates an open file descriptor to the lowest available FD number.
+ */
+export function vfs_dup(oldfd: number): number {
+    if (oldfd < 0 || (oldfd as u64) >= MAX_FDS) {
+        return -9; // -EBADF
+    }
+    const src_ptr = get_fd_ptr(oldfd as u64);
+    if (peek8(src_ptr + 0n) === (0 as u8)) {
+        return -9; // -EBADF
+    }
+
+    let free_fd: u64 = 0n;
+    for (let i = 0n; i < MAX_FDS; i = i + 1n) {
+        const ptr = get_fd_ptr(i);
+        if (peek8(ptr + 0n) === (0 as u8)) {
+            free_fd = i;
+            break;
+        }
+    }
+    if (free_fd === 0n) {
+        return -24; // -EMFILE
+    }
+
+    const dst_ptr = get_fd_ptr(free_fd);
+    for (let i = 0n; i < (FD_ENTRY_SIZE >> 3n); i = i + 1n) {
+        poke64(dst_ptr + i * 8n, peek64(src_ptr + i * 8n));
+    }
+    return free_fd as number;
+}
+
+/**
+ * Duplicates an open file descriptor onto a specific new FD number.
+ */
+export function vfs_dup2(oldfd: number, newfd: number): number {
+    if (oldfd < 0 || (oldfd as u64) >= MAX_FDS || newfd < 0 || (newfd as u64) >= MAX_FDS) {
+        return -9; // -EBADF
+    }
+    const src_ptr = get_fd_ptr(oldfd as u64);
+    if (peek8(src_ptr + 0n) === (0 as u8)) {
+        return -9; // -EBADF
+    }
+    if (oldfd === newfd) {
+        return newfd;
+    }
+    vfs_close(newfd);
+    const dst_ptr = get_fd_ptr(newfd as u64);
+    for (let i = 0n; i < (FD_ENTRY_SIZE >> 3n); i = i + 1n) {
+        poke64(dst_ptr + i * 8n, peek64(src_ptr + i * 8n));
+    }
+    return newfd;
+}
+
+/**
  * Reads from an open file descriptor at current offset, advancing offset.
  */
 export function vfs_read(fd: number, dest_buf: bigint, count: u64): u64 {
@@ -160,10 +214,18 @@ export function vfs_read(fd: number, dest_buf: bigint, count: u64): u64 {
 
     const fs_type = peek8(fd_ptr + 1n);
     if (fs_type === (1 as u8)) {
-        // TTY / stdin: read nothing for now
-        return 0n;
+        // TTY / stdin: read from UART
+        if (count === 0n) return 0n;
+        let c = getchar();
+        if (c === (4 as u8)) {
+            return 0n; // EOF
+        }
+        if (c === (13 as u8)) {
+            c = 10 as u8; // \r -> \n
+        }
+        poke8(dest_buf, c);
+        return 1n;
     }
-
     const offset = peek64(fd_ptr + 8n);
     const fd_inode = fd_ptr + 32n;
     const bytes_read = ext2_read_data(fd_inode, offset, count, dest_buf);
@@ -208,9 +270,12 @@ export function vfs_lseek(fd: number, offset: u64, whence: number): u64 {
         return -9n as u64; // -EBADF
     }
 
+    const fs_type = peek8(fd_ptr + 1n);
+    if (fs_type === (1 as u8)) {
+        return -29n as u64; // -ESPIPE
+    }
     const cur_offset = peek64(fd_ptr + 8n);
     const size = peek64(fd_ptr + 16n);
-
     let new_offset: u64 = 0n;
     if (whence === 0) {
         new_offset = offset;
