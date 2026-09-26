@@ -1,6 +1,6 @@
 // AArch64 Exception and Interrupt Dispatcher
-import { print, printHex64, peek64, poke64, lshr64 } from "./uart.ts";
-import { handle_linux_syscall } from "./syscall.ts";
+import { print, printHex64, lshr64 } from "./uart.ts";
+import { handle_linux_syscall, type TrapFrame } from "./syscall.ts";
 
 /**
  * Installs the exception vector table by setting VBAR_EL1.
@@ -16,9 +16,10 @@ function init_exceptions(): void {
  * Handles synchronous exceptions from Current EL with SPx (Kernel space).
  */
 function handle_sync_exception(frame_ptr: bigint): void {
-	const elr = peek64(frame_ptr + 248n);
-	const esr = peek64(frame_ptr + 264n);
-	const far = peek64(frame_ptr + 272n);
+	const frame = <Ref<TrapFrame>>(<Opaque>frame_ptr);
+	const elr = frame.elr;
+	const esr = frame.esr;
+	const far = frame.far;
 	const ec = lshr64(esr, 26n) & 0x3fn;
 
 	print("\n[tsos] Kernel Synchronous Exception!\n");
@@ -45,15 +46,16 @@ function handle_sync_exception(frame_ptr: bigint): void {
  * Handles synchronous exceptions from Lower EL using AArch64 (Userspace EL0).
  */
 function handle_lower_sync_exception(frame_ptr: bigint): void {
-	const elr = peek64(frame_ptr + 248n);
-	const esr = peek64(frame_ptr + 264n);
+	const frame = <Ref<TrapFrame>>(<Opaque>frame_ptr);
+	const elr = frame.elr;
+	const esr = frame.esr;
 	const ec = lshr64(esr, 26n) & 0x3fn;
 
 	if (ec === 0x15n) {
 		// AArch64 SVC (Linux System Call)
 		handle_linux_syscall(frame_ptr);
 	} else {
-		const far = peek64(frame_ptr + 272n);
+		const far = frame.far;
 		print("\n[tsos] Userspace Exception (EC=0x");
 		printHex64(ec);
 		print(" at PC=0x");
