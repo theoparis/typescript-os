@@ -6,7 +6,7 @@ function isb(): void {
 	inline_asm("isb", "");
 }
 
-function dsb_ish(): void {
+export function dsb_ish(): void {
 	inline_asm("dsb ish", "");
 }
 
@@ -286,6 +286,16 @@ function init_mmu(): void {
 		poke64(
 			l2_table_0 + 72n * 8n,
 			0x09000000n |
+				FLAG_UXN |
+				FLAG_PXN |
+				FLAG_AF |
+				shl64(ATTR_DEVICE, 2n) |
+				0x1n,
+		);
+		// Map VirtIO MMIO (0x0a000000 >> 21 = 80) as 2MB Device block
+		poke64(
+			l2_table_0 + 80n * 8n,
+			0x0a000000n |
 				FLAG_UXN |
 				FLAG_PXN |
 				FLAG_AF |

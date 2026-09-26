@@ -17,6 +17,11 @@ function peek16(addr: bigint): u32 {
     return Deref(p) as u32;
 }
 
+function poke16(addr: bigint, val: u16): void {
+    const p = <Ref<u16>>(<Opaque>addr);
+    Deref(p) = val;
+}
+
 function poke32(addr: bigint, val: u32): void {
     const p = <Ref<u32>>(<Opaque>addr);
     Deref(p) = val;

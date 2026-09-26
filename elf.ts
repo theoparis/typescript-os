@@ -1,166 +1,332 @@
-// Static Linux ELF64 Loader and Userspace Execution for tsos
-import { print, printHex64 } from "./uart.ts";
+// Linux ELF64 Loader (Static & Dynamic with PT_INTERP) for tsos
+import {
+    peek8,
+    poke8,
+    peek16,
+    peek32,
+    peek64,
+    poke64,
+    print,
+    printHex64,
+    lshr64,
+    shl64,
+} from "./uart.ts";
 import { alloc_page, map_user_page } from "./mmu.ts";
+import { vfs_open, vfs_close, vfs_read, vfs_fstat } from "./vfs.ts";
 
-export type Elf64_Ehdr = {
-  e_magic: u32; // 0x464c457f (0x7f, 'E', 'L', 'F')
-  e_ident1: u32;
-  e_ident2: u32;
-  e_ident3: u32;
-  e_type: u16;
-  e_machine: u16;
-  e_version: u32;
-  e_entry: u64;
-  e_phoff: u64;
-  e_shoff: u64;
-  e_flags: u32;
-  e_ehsize: u16;
-  e_phentsize: u16;
-  e_phnum: u16;
-  e_shentsize: u16;
-  e_shnum: u16;
-  e_shstrndx: u16;
-};
+const ELF_MAGIC = 0x464c457f as u32; // "\x7fELF"
+const EM_AARCH64 = 183 as u16;
+const ET_EXEC = 2 as u16;
+const ET_DYN  = 3 as u16;
 
-export type Elf64_Phdr = {
-  p_type: u32;
-  p_flags: u32;
-  p_offset: u64;
-  p_vaddr: u64;
-  p_paddr: u64;
-  p_filesz: u64;
-  p_memsz: u64;
-  p_align: u64;
-};
+const PT_LOAD   = 1 as u32;
+const PT_INTERP = 3 as u32;
+const PT_PHDR   = 6 as u32;
 
-export type LinuxUserStack = {
-  argc: u64;
-  argv0: u64;
-  argv_null: u64;
-  envp_null: u64;
-  at_pagesz_key: u64;
-  at_pagesz_val: u64;
-  at_null_key: u64;
-  at_null_val: u64;
-};
-
-function get_elf_base(): bigint {
-  return inline_asm<u64>(
-    "adrp $0, user_elf_start\nadd $0, $0, :lo12:user_elf_start",
-    "=r",
-  );
-}
+const MAIN_EXEC_BASE = 0x0000000000400000n; // 4MB base for PIE
+const INTERP_BASE    = 0x0000000010000000n; // 256MB base for dynamic linker
+const USER_STACK_TOP = 0x0000000020000000n; // 512MB top of user stack
 
 function drop_to_user(sp: bigint, pc: bigint): void {
-  inline_asm(
-    "msr sp_el0, $0\nmsr elr_el1, $1\nmsr spsr_el1, $2\nisb\neret",
-    "r,r,r",
-    sp,
-    pc,
-    0n, // SPSR_EL1 = 0 (EL0t mode, all interrupts unmasked)
-  );
+    inline_asm(
+        "msr sp_el0, $0\nmsr elr_el1, $1\nmsr spsr_el1, $2\nmov x0, #0\nmov x1, #0\nmov x2, #0\nmov x3, #0\nisb\neret",
+        "r,r,r",
+        sp,
+        pc,
+        0n, // SPSR_EL1 = 0 (EL0t mode, all interrupts unmasked)
+    );
+}
+
+function copy_str_to_user(dest_addr: bigint, src_str: string): u64 {
+    const src = <Ref<u8>>(<Opaque>src_str);
+    let i: u64 = 0n;
+    while (true) {
+        const ch = Deref(src[i]);
+        poke8(dest_addr + i, ch);
+        if (ch === (0 as u8)) break;
+        i = i + 1n;
+    }
+    return i;
 }
 
 /**
- * Loads the embedded static Linux ELF executable into user space memory,
- * constructs the initial Linux ABI stack, and transitions to EL0.
+ * Loads and executes a Linux ELF executable (static or dynamically-linked).
  */
-function load_and_run_elf(): void {
-  const elf = get_elf_base();
-  const ehdr = <Ref<Elf64_Ehdr>>(<Opaque>elf);
+export function load_and_run_elf_file(
+    path: string,
+    argv0: string,
+    argv1: string,
+): boolean {
+    print("[ELF] Loading executable: ");
+    print(path);
+    print("\n");
 
-  // Verify ELF Magic: 0x7f, 'E', 'L', 'F' (0x464c457f in little-endian)
-  if (ehdr.e_magic !== (0x464c457f as u32)) {
-    print("[ELF] Error: Invalid ELF magic bytes!\n");
-    return;
-  }
-
-  const e_entry = ehdr.e_entry;
-  const e_phoff = ehdr.e_phoff;
-  const e_phnum = ehdr.e_phnum as u64;
-
-  print("[ELF] Loading static Linux ELF... Entry point: 0x");
-  printHex64(e_entry);
-  print("\n");
-
-  // Process all PT_LOAD segments
-  const ph_base = <Ref<Elf64_Phdr>>(<Opaque>(elf + e_phoff));
-  for (let i = 0n; i < e_phnum; i = i + 1n) {
-    const ph = ph_base[i];
-    const p_type = ph.p_type;
-    const p_flags = ph.p_flags;
-    const p_offset = ph.p_offset;
-    const p_vaddr = ph.p_vaddr;
-    const p_filesz = ph.p_filesz;
-    const p_memsz = ph.p_memsz;
-
-    if (p_type === (1 as u32)) {
-      // PT_LOAD segment
-      const is_exec = (p_flags & (1 as u32)) !== (0 as u32);
-      const is_write = (p_flags & (2 as u32)) !== (0 as u32);
-
-      const page_size = 4096n;
-      const vaddr_start = p_vaddr & ~0xfffn;
-      const vaddr_end = (p_vaddr + p_memsz + 4095n) & ~0xfffn;
-
-      const elf_bytes = <Ref<u8>>(<Opaque>elf);
-
-      for (let v = vaddr_start; v < vaddr_end; v = v + page_size) {
-        const phys = alloc_page();
-        const phys_bytes = <Ref<u8>>(<Opaque>phys);
-
-        // Copy segment file contents into the page and zero BSS
-        for (let off = 0n; off < page_size; off = off + 1n) {
-          const curr_va = v + off;
-          if (curr_va >= p_vaddr && curr_va < p_vaddr + p_filesz) {
-            const file_off = p_offset + (curr_va - p_vaddr);
-            Deref(phys_bytes[off]) = Deref(elf_bytes[file_off]);
-          } else {
-            Deref(phys_bytes[off]) = 0 as u8;
-          }
-        }
-        map_user_page(v, phys, is_write, is_exec);
-      }
+    const fd = vfs_open(path, 0 as u32, 0 as u32);
+    if (fd < 0) {
+        print("[ELF] Error: Failed to open executable!\n");
+        return false;
     }
-  }
 
-  // Allocate and map User Stack (4KB at 0x20000000)
-  const USER_STACK_TOP = 0x0000000020000000n;
-  const stack_phys = alloc_page();
-  map_user_page(USER_STACK_TOP - 4096n, stack_phys, true, false);
+    const stat_page = alloc_page();
+    vfs_fstat(fd, stat_page);
+    const file_size = peek64(stat_page + 48n);
 
-  // Initial user stack frame (AArch64 Linux ABI)
-  const user_sp = USER_STACK_TOP - 128n;
-  const stack_frame = <Ref<LinuxUserStack>>(<Opaque>user_sp);
-  const str_addr = user_sp + 64n;
+    // Allocate contiguous buffer to hold the executable
+    const num_pages = (file_size + 4095n) >> 12n;
+    const exec_buf = alloc_page();
+    for (let i = 1n; i < num_pages; i = i + 1n) {
+        alloc_page();
+    }
 
-  stack_frame.argc = 1n;
-  stack_frame.argv0 = str_addr;
-  stack_frame.argv_null = 0n;
-  stack_frame.envp_null = 0n;
-  stack_frame.at_pagesz_key = 6n;
-  stack_frame.at_pagesz_val = 4096n;
-  stack_frame.at_null_key = 0n;
-  stack_frame.at_null_val = 0n;
+    const bytes_read = vfs_read(fd, exec_buf, file_size);
+    vfs_close(fd);
 
-  // "init\0" string on stack
-  const str_bytes = <Ref<u8>>(<Opaque>str_addr);
-  const init_str = <Ref<u8>>(<Opaque>"init");
-  let s_idx = 0n;
-  while (true) {
-    const ch = Deref(init_str[s_idx]);
-    Deref(str_bytes[s_idx]) = ch;
-    if (ch === (0 as u8)) break;
-    s_idx = s_idx + 1n;
-  }
+    if (bytes_read !== file_size) {
+        print("[ELF] Error: Truncated read of executable!\n");
+        return false;
+    }
 
-  // Invalidate instruction caches so newly mapped code is visible to CPU fetch
-  inline_asm("ic iallu\ndsb ish\nisb", "");
+    // Validate ELF header
+    const magic = peek32(exec_buf + 0n);
+    if (magic !== ELF_MAGIC) {
+        print("[ELF] Error: Invalid ELF magic bytes!\n");
+        return false;
+    }
 
-  print("[ELF] Dropping to EL0 userspace to run binary!\n");
-  print(
-    "--------------------------------------------------------------------\n",
-  );
+    const e_type = peek16(exec_buf + 16n) as u16;
+    const e_machine = peek16(exec_buf + 18n) as u16;
 
-  drop_to_user(user_sp, e_entry);
+    if (e_machine !== EM_AARCH64) {
+        print("[ELF] Error: Not an AArch64 ELF binary!\n");
+        return false;
+    }
+
+    const e_entry = peek64(exec_buf + 24n);
+    const e_phoff = peek64(exec_buf + 32n);
+    const e_phentsize = peek16(exec_buf + 54n) as u64;
+    const e_phnum = peek16(exec_buf + 56n) as u64;
+
+    const main_base = (e_type === ET_DYN) ? MAIN_EXEC_BASE : 0n;
+    const main_entry = main_base + e_entry;
+
+    print("[ELF] Main binary type: ");
+    printHex64(e_type as u64);
+    print(", Entry point: 0x");
+    printHex64(main_entry);
+    print(", Program headers: ");
+    printHex64(e_phnum);
+    print("\n");
+
+    // Scan program headers for PT_INTERP and PT_PHDR
+    let interp_path_off: u64 = 0n;
+    let interp_path_len: u64 = 0n;
+    let at_phdr = main_base + e_phoff;
+
+    for (let i = 0n; i < e_phnum; i = i + 1n) {
+        const ph = exec_buf + e_phoff + i * e_phentsize;
+        const p_type = peek32(ph + 0n);
+        if (p_type === PT_INTERP) {
+            interp_path_off = peek64(ph + 8n);
+            interp_path_len = peek64(ph + 32n);
+        } else if (p_type === PT_PHDR) {
+            at_phdr = main_base + peek64(ph + 16n);
+        }
+    }
+
+    // Load PT_LOAD segments for main executable
+    for (let i = 0n; i < e_phnum; i = i + 1n) {
+        const ph = exec_buf + e_phoff + i * e_phentsize;
+        const p_type = peek32(ph + 0n);
+        if (p_type === PT_LOAD) {
+            const p_flags = peek32(ph + 4n);
+            const p_offset = peek64(ph + 8n);
+            const p_vaddr = peek64(ph + 16n);
+            const p_filesz = peek64(ph + 32n);
+            const p_memsz = peek64(ph + 40n);
+
+            const is_write = (p_flags & (2 as u32)) !== (0 as u32);
+            const is_exec = (p_flags & (1 as u32)) !== (0 as u32);
+
+            const va_start = (main_base + p_vaddr) & ~0xfffn;
+            const va_end = (main_base + p_vaddr + p_memsz + 4095n) & ~0xfffn;
+
+            for (let v = va_start; v < va_end; v = v + 4096n) {
+                const phys = alloc_page();
+                for (let off = 0n; off < 4096n; off = off + 1n) {
+                    const curr_va = v + off;
+                    if (curr_va >= main_base + p_vaddr && curr_va < main_base + p_vaddr + p_filesz) {
+                        const file_off = p_offset + (curr_va - (main_base + p_vaddr));
+                        poke8(phys + off, peek8(exec_buf + file_off));
+                    } else {
+                        poke8(phys + off, 0 as u8);
+                    }
+                }
+                // Map page (writable if requested, or if executable)
+                map_user_page(v, phys, is_write, is_exec);
+            }
+        }
+    }
+
+    let has_interp = false;
+    let interp_base = 0n;
+    let interp_entry = 0n;
+
+    // Load interpreter if requested by PT_INTERP
+    if (interp_path_len > 0n) {
+        has_interp = true;
+        interp_base = INTERP_BASE;
+
+        // Extract interpreter path string
+        const interp_path_buf = alloc_page();
+        for (let i = 0n; i < interp_path_len; i = i + 1n) {
+            poke8(interp_path_buf + i, peek8(exec_buf + interp_path_off + i));
+        }
+        poke8(interp_path_buf + interp_path_len, 0 as u8);
+
+        print("[ELF] Binary requires dynamic linker: \"");
+        for (let i = 0n; i < interp_path_len; i = i + 1n) {
+            const c = peek8(interp_path_buf + i);
+            if (c === (0 as u8)) break;
+            putchar(c);
+        }
+        print("\"\n");
+
+        // Convert path bytes to string for vfs_open
+        // In tsos, string is a pointer to null-terminated UTF-8 bytes!
+        const interp_path_str = <string>(<Opaque>interp_path_buf);
+        const ifd = vfs_open(interp_path_str, 0 as u32, 0 as u32);
+        if (ifd < 0) {
+            print("[ELF] Error: Failed to open dynamic linker from rootfs!\n");
+            return false;
+        }
+
+        vfs_fstat(ifd, stat_page);
+        const interp_size = peek64(stat_page + 48n);
+
+        const interp_pages = (interp_size + 4095n) >> 12n;
+        const interp_buf = alloc_page();
+        for (let i = 1n; i < interp_pages; i = i + 1n) {
+            alloc_page();
+        }
+
+        vfs_read(ifd, interp_buf, interp_size);
+        vfs_close(ifd);
+
+        // Validate interpreter ELF
+        if (peek32(interp_buf + 0n) !== ELF_MAGIC) {
+            print("[ELF] Error: Invalid dynamic linker ELF magic!\n");
+            return false;
+        }
+
+        interp_entry = interp_base + peek64(interp_buf + 24n);
+        const interp_phoff = peek64(interp_buf + 32n);
+        const interp_phentsize = peek16(interp_buf + 54n) as u64;
+        const interp_phnum = peek16(interp_buf + 56n) as u64;
+
+        print("[ELF] Loaded dynamic linker, entry point: 0x");
+        printHex64(interp_entry);
+        print("\n");
+
+        // Load interpreter PT_LOAD segments
+        for (let i = 0n; i < interp_phnum; i = i + 1n) {
+            const ph = interp_buf + interp_phoff + i * interp_phentsize;
+            const p_type = peek32(ph + 0n);
+            if (p_type === PT_LOAD) {
+                const p_flags = peek32(ph + 4n);
+                const p_offset = peek64(ph + 8n);
+                const p_vaddr = peek64(ph + 16n);
+                const p_filesz = peek64(ph + 32n);
+                const p_memsz = peek64(ph + 40n);
+
+                const is_write = (p_flags & (2 as u32)) !== (0 as u32);
+                const is_exec = (p_flags & (1 as u32)) !== (0 as u32);
+
+                const va_start = (interp_base + p_vaddr) & ~0xfffn;
+                const va_end = (interp_base + p_vaddr + p_memsz + 4095n) & ~0xfffn;
+
+                for (let v = va_start; v < va_end; v = v + 4096n) {
+                    const phys = alloc_page();
+                    for (let off = 0n; off < 4096n; off = off + 1n) {
+                        const curr_va = v + off;
+                        if (curr_va >= interp_base + p_vaddr && curr_va < interp_base + p_vaddr + p_filesz) {
+                            const file_off = p_offset + (curr_va - (interp_base + p_vaddr));
+                            poke8(phys + off, peek8(interp_buf + file_off));
+                        } else {
+                            poke8(phys + off, 0 as u8);
+                        }
+                    }
+                    map_user_page(v, phys, is_write, is_exec);
+                }
+            }
+        }
+    }
+
+    // Allocate and map User Stack (64KB at USER_STACK_TOP)
+    for (let p = USER_STACK_TOP - 65536n; p < USER_STACK_TOP; p = p + 4096n) {
+        map_user_page(p, alloc_page(), true, false);
+    }
+
+    // Set up strings in user stack top with ample spacing (512 bytes each)
+    const str_argv0 = USER_STACK_TOP - 2048n;
+    const str_argv1 = USER_STACK_TOP - 1536n;
+    const str_execfn = USER_STACK_TOP - 1024n;
+    const random_bytes = USER_STACK_TOP - 512n;
+
+    copy_str_to_user(str_argv0, argv0);
+    const p1 = <Ref<u8>>(<Opaque>argv1);
+    const has_arg1 = Deref(p1[0n]) !== (0 as u8);
+    if (has_arg1) {
+        copy_str_to_user(str_argv1, argv1);
+    }
+    copy_str_to_user(str_execfn, path);
+
+    // 16 bytes of random values
+    poke64(random_bytes + 0n, 0x0123456789abcdefn);
+    poke64(random_bytes + 8n, 0x7edcba9876543210n);
+
+    // Stack pointer layout (16-byte aligned at USER_STACK_TOP - 4096n)
+    const user_sp = USER_STACK_TOP - 4096n;
+    const argc = has_arg1 ? 2n : 1n;
+
+    poke64(user_sp + 0n, argc);
+    poke64(user_sp + 8n, str_argv0);
+    if (has_arg1) {
+        poke64(user_sp + 16n, str_argv1);
+        poke64(user_sp + 24n, 0n); // argv[2] = NULL
+        poke64(user_sp + 32n, 0n); // envp[0] = NULL
+    } else {
+        poke64(user_sp + 16n, 0n); // argv[1] = NULL
+        poke64(user_sp + 24n, 0n); // envp[0] = NULL
+    }
+
+    // Auxiliary vectors (start at offset 40 if argc=2, or 32 if argc=1)
+    const auxv_base = user_sp + (has_arg1 ? 40n : 32n);
+
+    poke64(auxv_base + 0n, 3n); poke64(auxv_base + 8n, at_phdr);
+    poke64(auxv_base + 16n, 4n); poke64(auxv_base + 24n, e_phentsize);
+    poke64(auxv_base + 32n, 5n); poke64(auxv_base + 40n, e_phnum);
+    poke64(auxv_base + 48n, 6n); poke64(auxv_base + 56n, 4096n);
+    poke64(auxv_base + 64n, 7n); poke64(auxv_base + 72n, has_interp ? interp_base : 0n);
+    poke64(auxv_base + 80n, 8n); poke64(auxv_base + 88n, 0n);
+    poke64(auxv_base + 96n, 9n); poke64(auxv_base + 104n, main_entry);
+    poke64(auxv_base + 112n, 11n); poke64(auxv_base + 120n, 0n);
+    poke64(auxv_base + 128n, 12n); poke64(auxv_base + 136n, 0n);
+    poke64(auxv_base + 144n, 13n); poke64(auxv_base + 152n, 0n);
+    poke64(auxv_base + 160n, 14n); poke64(auxv_base + 168n, 0n);
+    poke64(auxv_base + 176n, 17n); poke64(auxv_base + 184n, 100n);
+    poke64(auxv_base + 192n, 23n); poke64(auxv_base + 200n, 0n);
+    poke64(auxv_base + 208n, 25n); poke64(auxv_base + 216n, random_bytes);
+    poke64(auxv_base + 224n, 31n); poke64(auxv_base + 232n, str_execfn);
+    poke64(auxv_base + 240n, 0n); poke64(auxv_base + 248n, 0n);
+    // Invalidate instruction caches
+    inline_asm("ic iallu\ndsb ish\nisb", "");
+
+    const entry_pc = has_interp ? interp_entry : main_entry;
+
+    print("[ELF] Dropping to EL0 userspace to run binary! Entry: 0x");
+    printHex64(entry_pc);
+    print("\n--------------------------------------------------------------------\n");
+
+    drop_to_user(user_sp, entry_pc);
+    return true;
 }
