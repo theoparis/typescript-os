@@ -1,4 +1,4 @@
-// AArch64 MMU Setup and Multi-level Paging (4KB and 16KB granules)
+// AArch64 MMU Setup and Paging (supporting 4KB and 16KB granules)
 
 declare const CONFIG_USE_16K: boolean;
 declare function print(s: string): void;
@@ -91,14 +91,12 @@ const FLAG_PXN: u64 = shl64(1n, 53n);
 let root_table: bigint = 0n;
 
 /**
- * Maps a virtual page to a physical frame.
- * Supports both 4KB (L1 -> L2 -> L3) and 16KB (L2 -> L3) translation schemes.
+ * Maps a single virtual page to a physical frame for kernel usage.
  */
 function map_page(va: bigint, pa: bigint, is_device: boolean): void {
     if (CONFIG_USE_16K) {
-        // 16KB Granule, 36-bit VA: Level 2 -> Level 3
-        const l2_idx = lshr64(va, 25n) & 0x7ffn; // bits [35:25]
-        const l3_idx = lshr64(va, 14n) & 0x7ffn; // bits [24:14]
+        const l2_idx = lshr64(va, 25n) & 0x7ffn;
+        const l3_idx = lshr64(va, 14n) & 0x7ffn;
 
         let l2_entry = peek64(root_table + l2_idx * 8n);
         let l3_table: bigint = 0n;
@@ -117,17 +115,15 @@ function map_page(va: bigint, pa: bigint, is_device: boolean): void {
         }
         poke64(l3_table + l3_idx * 8n, (pa & ~0x3fffn) | attrs);
 
-        // Flush TLB for this single page
         dsb_ish();
         isb();
         tlbi_va(lshr64(va, 14n));
         dsb_ish();
         isb();
     } else {
-        // 4KB Granule, 39-bit VA: Level 1 -> Level 2 -> Level 3
-        const l1_idx = lshr64(va, 30n) & 0x1ffn; // bits [38:30]
-        const l2_idx = lshr64(va, 21n) & 0x1ffn; // bits [29:21]
-        const l3_idx = lshr64(va, 12n) & 0x1ffn; // bits [20:12]
+        const l1_idx = lshr64(va, 30n) & 0x1ffn;
+        const l2_idx = lshr64(va, 21n) & 0x1ffn;
+        const l3_idx = lshr64(va, 12n) & 0x1ffn;
 
         let l1_entry = peek64(root_table + l1_idx * 8n);
         let l2_table: bigint = 0n;
@@ -155,7 +151,6 @@ function map_page(va: bigint, pa: bigint, is_device: boolean): void {
         }
         poke64(l3_table + l3_idx * 8n, (pa & ~0xfffn) | attrs);
 
-        // Flush TLB for this single page
         dsb_ish();
         isb();
         tlbi_va(lshr64(va, 12n));
@@ -165,8 +160,78 @@ function map_page(va: bigint, pa: bigint, is_device: boolean): void {
 }
 
 /**
- * Sets up identity mapping for MMIO and RAM, configures TCR_EL1/MAIR_EL1,
- * and activates the MMU and L1 caches.
+ * Maps a single virtual page with user (EL0) access permissions.
+ * AP[2:1]: 0b01 = EL1 RW, EL0 RW (if write)
+ *          0b11 = EL1 RO, EL0 RO (if read-only)
+ * UXN: 0 if executable, 1 if non-executable (stack/data)
+ * PXN: 1 (kernel cannot execute user pages)
+ */
+function map_user_page(va: bigint, pa: bigint, is_write: boolean, is_exec: boolean): void {
+    let ap: u64 = shl64(1n, 6n); // 0b01: EL1 RW, EL0 RW
+    if (!is_write) {
+        ap = shl64(3n, 6n);      // 0b11: EL1 RO, EL0 RO
+    }
+
+    let attrs: u64 = FLAG_PAGE | FLAG_AF | FLAG_SH_INNER | shl64(ATTR_NORMAL, 2n) | ap | FLAG_PXN;
+    if (!is_exec) {
+        attrs = attrs | FLAG_UXN;
+    }
+
+    if (CONFIG_USE_16K) {
+        const l2_idx = lshr64(va, 25n) & 0x7ffn;
+        const l3_idx = lshr64(va, 14n) & 0x7ffn;
+
+        let l2_entry = peek64(root_table + l2_idx * 8n);
+        let l3_table: bigint = 0n;
+        if ((l2_entry & 1n) == 0n) {
+            l3_table = alloc_page();
+            poke64(root_table + l2_idx * 8n, l3_table | FLAG_TABLE);
+        } else {
+            l3_table = l2_entry & ~0x3fffn;
+        }
+
+        poke64(l3_table + l3_idx * 8n, (pa & ~0x3fffn) | attrs);
+
+        dsb_ish();
+        isb();
+        tlbi_va(lshr64(va, 14n));
+        dsb_ish();
+        isb();
+    } else {
+        const l1_idx = lshr64(va, 30n) & 0x1ffn;
+        const l2_idx = lshr64(va, 21n) & 0x1ffn;
+        const l3_idx = lshr64(va, 12n) & 0x1ffn;
+
+        let l1_entry = peek64(root_table + l1_idx * 8n);
+        let l2_table: bigint = 0n;
+        if ((l1_entry & 1n) == 0n) {
+            l2_table = alloc_page();
+            poke64(root_table + l1_idx * 8n, l2_table | FLAG_TABLE);
+        } else {
+            l2_table = l1_entry & ~0xfffn;
+        }
+
+        let l2_entry = peek64(l2_table + l2_idx * 8n);
+        let l3_table: bigint = 0n;
+        if ((l2_entry & 1n) == 0n) {
+            l3_table = alloc_page();
+            poke64(l2_table + l2_idx * 8n, l3_table | FLAG_TABLE);
+        } else {
+            l3_table = l2_entry & ~0xfffn;
+        }
+
+        poke64(l3_table + l3_idx * 8n, (pa & ~0xfffn) | attrs);
+
+        dsb_ish();
+        isb();
+        tlbi_va(lshr64(va, 12n));
+        dsb_ish();
+        isb();
+    }
+}
+
+/**
+ * Initializes the MMU with identity mappings and prepares user space translation.
  */
 function init_mmu(): void {
     init_allocator();
@@ -174,30 +239,37 @@ function init_mmu(): void {
 
     if (CONFIG_USE_16K) {
         // 16KB Granule: Root table is Level 2 (2048 entries of 32MB blocks)
-        // 0..1GB (32 entries): Device MMIO (UART, GIC)
-        for (let i = 0n; i < 32n; i = i + 1n) {
-            const pa = i * 0x02000000n; // 32MB
+        // Block 0 [0..32MB): Left for L3 tables (user space ELFs at 0x200000 = 2MB)
+        // Blocks 1..31 [32MB..1GB): Device MMIO
+        for (let i = 1n; i < 32n; i = i + 1n) {
+            const pa = i * 0x02000000n;
             const entry = pa | FLAG_AF | FLAG_UXN | FLAG_PXN | shl64(ATTR_DEVICE, 2n) | 0x1n;
             poke64(root_table + i * 8n, entry);
         }
-        // 1GB..2GB (32 entries): Normal RAM
+        // Blocks 32..63 [1GB..2GB): Normal RAM (Kernel space)
         for (let i = 32n; i < 64n; i = i + 1n) {
-            const pa = i * 0x02000000n; // 32MB
+            const pa = i * 0x02000000n;
             const entry = pa | FLAG_AF | FLAG_SH_INNER | shl64(ATTR_NORMAL, 2n) | 0x1n;
             poke64(root_table + i * 8n, entry);
         }
 
-        // TCR_EL1: T0SZ=28 (36-bit VA), TG0=2 (16KB), SH0=3 (Inner), EPD1=1, IPS=2 (40-bit PA)
         const tcr = (2n << 32n) | (1n << 23n) | (2n << 14n) | (3n << 12n) | 28n;
         write_tcr_el1(tcr);
     } else {
         // 4KB Granule: Root table is Level 1 (512 entries of 1GB blocks)
-        // 0..1GB: Device MMIO
-        poke64(root_table + 0n * 8n, FLAG_UXN | FLAG_PXN | FLAG_AF | shl64(ATTR_DEVICE, 2n) | 0x1n);
-        // 1GB..2GB: Normal RAM
+        // Entry 0 (0..1GB): Point to an L2 table so we can separate MMIO and Userspace!
+        const l2_table_0 = alloc_page();
+        poke64(root_table + 0n * 8n, l2_table_0 | FLAG_TABLE);
+
+        // In l2_table_0 (each entry maps 2MB):
+        // Map GIC (0x08000000 >> 21 = 64) as 2MB Device block
+        poke64(l2_table_0 + 64n * 8n, 0x08000000n | FLAG_UXN | FLAG_PXN | FLAG_AF | shl64(ATTR_DEVICE, 2n) | 0x1n);
+        // Map UART (0x09000000 >> 21 = 72) as 2MB Device block
+        poke64(l2_table_0 + 72n * 8n, 0x09000000n | FLAG_UXN | FLAG_PXN | FLAG_AF | shl64(ATTR_DEVICE, 2n) | 0x1n);
+
+        // Entry 1 (1GB..2GB): 1GB Normal RAM block (Kernel code, data, stack, heap)
         poke64(root_table + 1n * 8n, 0x40000000n | FLAG_AF | FLAG_SH_INNER | shl64(ATTR_NORMAL, 2n) | 0x1n);
 
-        // TCR_EL1: T0SZ=25 (39-bit VA), TG0=0 (4KB), SH0=3 (Inner), EPD1=1, IPS=2 (40-bit PA)
         const tcr = (2n << 32n) | (1n << 23n) | (0n << 14n) | (3n << 12n) | 25n;
         write_tcr_el1(tcr);
     }

@@ -1,10 +1,12 @@
-// AArch64 Exception and Interrupt Handling
+// AArch64 Exception and Interrupt Dispatcher
 
 declare function print(s: string): void;
 declare function printHex64(v: u64): void;
 declare function peek64(addr: bigint): u64;
 declare function poke64(addr: bigint, val: u64): void;
 declare function lshr64(v: u64, shift: u64): u64;
+
+declare function handle_linux_syscall(frame_ptr: bigint): void;
 
 /**
  * Installs the exception vector table by setting VBAR_EL1.
@@ -14,24 +16,15 @@ function init_exceptions(): void {
 }
 
 /**
- * Dispatches synchronous exceptions from current or lower EL.
- * TrapFrame layout at frame_ptr:
- *   [0..239]: x0..x29, x30
- *   [248]: ELR_EL1 (return address)
- *   [256]: SPSR_EL1 (saved processor state)
- *   [264]: ESR_EL1 (exception syndrome)
- *   [272]: FAR_EL1 (fault address)
+ * Handles synchronous exceptions from Current EL with SPx (Kernel space).
  */
 function handle_sync_exception(frame_ptr: bigint): void {
     const elr = peek64(frame_ptr + 248n);
-    const spsr = peek64(frame_ptr + 256n);
     const esr = peek64(frame_ptr + 264n);
     const far = peek64(frame_ptr + 272n);
-
-    // Extract Exception Class (EC) from ESR_EL1 bits [31:26]
     const ec = lshr64(esr, 26n) & 0x3fn;
 
-    print("\n[tsos] Synchronous Exception Occurred!\n");
+    print("\n[tsos] Kernel Synchronous Exception!\n");
     print("       ESR_EL1: 0x");
     printHex64(esr);
     print(" (EC=0x");
@@ -43,38 +36,52 @@ function handle_sync_exception(frame_ptr: bigint): void {
     print("\n");
 
     if (ec == 0x15n) {
-        // SVC in AArch64 state (System Call)
-        // For SVC, ELR_EL1 already points to the instruction following SVC.
-        const imm = esr & 0xffffn;
-        print("       [SVC] System Call trapped! Immediate: 0x");
-        printHex64(imm);
-        print(" -> Handled successfully, resuming execution.\n");
-    } else if (ec == 0x24n || ec == 0x25n) {
-        // Data Abort (Page fault / memory access fault)
-        print("       [DATA ABORT] Faulting access to address 0x");
-        printHex64(far);
-        print("! Skipping faulting instruction to recover.\n");
-        // Advance ELR by 4 bytes to skip the faulting instruction
-        poke64(frame_ptr + 248n, elr + 4n);
-    } else if (ec == 0x20n || ec == 0x21n) {
-        // Instruction Abort
-        print("       [INSTRUCTION ABORT] Fault at instruction address 0x");
-        printHex64(far);
-        print("! Halting.\n");
-        while (true) {}
-    } else if (ec == 0x3cn) {
-        // Software Breakpoint (BRK)
-        print("       [BREAKPOINT] Breakpoint instruction hit. Resuming.\n");
-        poke64(frame_ptr + 248n, elr + 4n);
+        // SVC in kernel mode (e.g. self-test)
+        print("       -> Handled kernel SVC, resuming.\n");
     } else {
-        print("       [FATAL] Unhandled exception class! System halted.\n");
+        print("       -> Fatal kernel exception, halting.\n");
         while (true) {}
     }
 }
 
 /**
- * Dispatches IRQ interrupts from current or lower EL.
+ * Handles synchronous exceptions from Lower EL using AArch64 (Userspace EL0).
  */
-function handle_irq_exception(frame_ptr: bigint): void {
-    print("[tsos] IRQ Interrupt received!\n");
+function handle_lower_sync_exception(frame_ptr: bigint): void {
+    const elr = peek64(frame_ptr + 248n);
+    const esr = peek64(frame_ptr + 264n);
+    const ec = lshr64(esr, 26n) & 0x3fn;
+
+    if (ec == 0x15n) {
+        // AArch64 SVC (Linux System Call)
+        handle_linux_syscall(frame_ptr);
+    } else {
+        const far = peek64(frame_ptr + 272n);
+        print("\n[tsos] Userspace Exception (EC=0x");
+        printHex64(ec);
+        print(" at PC=0x");
+        printHex64(elr);
+        print(" FAR=0x");
+        printHex64(far);
+        print(")! Halting process.\n");
+        while (true) {}
+    }
+}
+
+/**
+ * Handles IRQs from both Current EL and Lower EL.
+ */
+function handle_irq_exception(frame_ptr: bigint): bigint {
+    // Acknowledge and EOI via system registers
+    const iar = inline_asm<u64>("mrs $0, icc_iar1_el1", "=r");
+    const intid = iar & 0x3ffn;
+
+    if (intid == 30n) {
+        // Physical timer PPI: reload timer for 50ms
+        const freq = inline_asm<u64>("mrs $0, cntfrq_el0", "=r");
+        inline_asm("msr cntp_tval_el0, $0", "r", freq / 20n);
+    }
+
+    inline_asm("msr icc_eoir1_el1, $0", "r", iar);
+    return frame_ptr;
 }

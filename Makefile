@@ -26,18 +26,23 @@ LINKER_SCRIPT ?= linker.ld
 TSFLAGS ?= --mtriple=$(TARGET_TRIPLE) --mm=rc --emit=obj
 ASFLAGS ?= --target=$(TARGET_TRIPLE)
 LDFLAGS ?= -fuse-ld=lld -nostdlib -T$(LINKER_SCRIPT) --target=$(TARGET_TRIPLE)
-QEMUFLAGS ?= -M virt -cpu $(QEMU_CPU) -nographic
+QEMUFLAGS ?= -M virt,gic-version=3 -cpu $(QEMU_CPU) -nographic
 
 OBJS := \
 	$(BUILD_DIR)/boot.o \
 	$(BUILD_DIR)/vectors.o \
+	$(BUILD_DIR)/embed.o \
 	$(BUILD_DIR)/config.o \
 	$(BUILD_DIR)/uart.o \
-	$(BUILD_DIR)/exceptions.o \
+	$(BUILD_DIR)/gic.o \
 	$(BUILD_DIR)/mmu.o \
+	$(BUILD_DIR)/syscall.o \
+	$(BUILD_DIR)/elf.o \
+	$(BUILD_DIR)/exceptions.o \
 	$(BUILD_DIR)/kmain.o
 
 CONFIG_TS := $(BUILD_DIR)/config.ts
+USER_ELF := $(BUILD_DIR)/init.elf
 
 export PATH := $(HOME)/src/TypeScriptCompiler/build/bin:$(PATH)
 
@@ -47,6 +52,14 @@ all: $(TARGET)
 
 $(TARGET): $(OBJS) $(LINKER_SCRIPT) | $(BUILD_DIR)/boot
 	$(CC) $(LDFLAGS) $(OBJS) -o $@
+
+# Build static Linux-compatible ELF binary for userspace execution
+$(USER_ELF): user/init.s | $(BUILD_DIR)
+	$(CC) --target=aarch64-linux-gnu -fuse-ld=lld -nostdlib -static $< -o $@
+
+# Assembly embed object depending on the built user ELF
+$(BUILD_DIR)/embed.o: embed.s $(USER_ELF) | $(BUILD_DIR)
+	$(CC) $(ASFLAGS) -c $< -o $@
 
 $(CONFIG_TS): FORCE | $(BUILD_DIR)
 	@echo "// Auto-generated configuration" > $@.tmp; \

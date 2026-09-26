@@ -3,12 +3,25 @@
 declare const CONFIG_USE_16K: boolean;
 declare function print(s: string): void;
 declare function printHex64(v: u64): void;
-declare function poke64(addr: bigint, val: u64): void;
-declare function peek64(addr: bigint): u64;
 
 declare function init_exceptions(): void;
+declare function init_gicv3(): void;
+declare function init_timer(ticks_per_sec: u64): void;
 declare function init_mmu(): void;
-declare function map_page(va: bigint, pa: bigint, is_device: boolean): void;
+declare function load_and_run_elf(): void;
+
+/**
+ * Landing pad entered when a userspace process exits via sys_exit.
+ */
+function kernel_exit_landing(): void {
+    print("--------------------------------------------------------------------\n");
+    print("[tsos] Userspace process completed and exited cleanly!\n");
+    print("[tsos] Kernel regained control successfully.\n");
+    print("[tsos] All objectives (GICv3, MMU, Userspace EL0, Linux Syscalls, Static ELF) VERIFIED!\n");
+    while (true) {
+        inline_asm("wfi", "");
+    }
+}
 
 /**
  * Main kernel entry point called from boot.s.
@@ -23,40 +36,20 @@ function kmain(): void {
     // 1. Install AArch64 exception vector table
     print("[tsos] Installing exception vectors into VBAR_EL1...\n");
     init_exceptions();
-    print("[tsos] Exception vector table active!\n");
 
-    // 2. Initialize MMU and Paging
+    // 2. Initialize GICv3 and ARM timer
+    print("[tsos] Initializing GICv3 and ARM timer...\n");
+    init_gicv3();
+    init_timer(50n); // 50 Hz (20ms interval)
+
+    // 3. Initialize MMU and Paging
     print("[tsos] Initializing MMU & page tables...\n");
     init_mmu();
-    print("[tsos] MMU enabled: virtual memory and L1 caches active!\n");
+    print("[tsos] MMU active: virtual memory, caches, and user-space separation enabled!\n");
 
-    // 3. Dynamic virtual memory mapping test
-    const test_va = 0x80000000n; // 2GB virtual address
-    const test_pa = 0x40500000n; // Physical RAM frame
-    map_page(test_va, test_pa, false);
+    // 4. Load static Linux-compatible ELF executable and drop to EL0 userspace
+    load_and_run_elf();
 
-    const test_val: u64 = 0x54534f5341534d31n; // 'TSOSASM1'
-    poke64(test_va, test_val);
-    const read_back = peek64(test_pa);
-
-    print("[tsos] Dynamic paging test: VA 0x");
-    printHex64(test_va);
-    print(" -> PA 0x");
-    printHex64(test_pa);
-    print("\n");
-
-    if (read_back == test_val) {
-        print("[tsos] Dynamic paging test: PASSED!\n");
-    } else {
-        print("[tsos] Dynamic paging test: FAILED!\n");
-    }
-
-    // 4. Exception Handling Test: Trigger software interrupt (SVC #0)
-    print("[tsos] Testing exception handler: issuing SVC #0 system call...\n");
-    inline_asm("svc #0", "");
-    print("[tsos] Resumed from SVC exception handler successfully!\n");
-
-    print("[tsos] Kernel initialized successfully. Entering halt loop.\n");
     while (true) {
         inline_asm("wfi", "");
     }

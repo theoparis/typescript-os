@@ -1,10 +1,30 @@
-// UART and Hardware Memory Primitives
+// UART and Hardware Memory / Arithmetic Primitives
 
 const UART_BASE = 0x09000000n;
 
 function poke8(addr: bigint, val: u8): void {
     const p = <Ref<u8>>(<Opaque>addr);
     Deref(p) = val;
+}
+
+function peek8(addr: bigint): u8 {
+    const p = <Ref<u8>>(<Opaque>addr);
+    return Deref(p);
+}
+
+function peek16(addr: bigint): u32 {
+    const p = <Ref<u16>>(<Opaque>addr);
+    return Deref(p) as u32;
+}
+
+function poke32(addr: bigint, val: u32): void {
+    const p = <Ref<u32>>(<Opaque>addr);
+    Deref(p) = val;
+}
+
+function peek32(addr: bigint): u32 {
+    const p = <Ref<u32>>(<Opaque>addr);
+    return Deref(p);
 }
 
 function poke64(addr: bigint, val: u64): void {
@@ -17,13 +37,17 @@ function peek64(addr: bigint): u64 {
     return Deref(p);
 }
 
-// 64-bit hardware shifts via inline asm to bypass 32-bit truncation
+// 64-bit hardware shifts & division via inline asm
 function lshr64(v: u64, shift: u64): u64 {
     return inline_asm<u64>("lsr $0, $1, $2", "=r,r,r", v, shift);
 }
 
 function shl64(v: u64, shift: u64): u64 {
     return inline_asm<u64>("lsl $0, $1, $2", "=r,r,r", v, shift);
+}
+
+function udiv64(n: u64, d: u64): u64 {
+    return inline_asm<u64>("udiv $0, $1, $2", "=r,r,r", n, d);
 }
 
 function putchar(c: u8): void {
