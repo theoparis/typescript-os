@@ -1,6 +1,7 @@
 // AArch64 Exception and Interrupt Dispatcher
-import { print, printHex64, lshr64 } from "./uart.ts";
+import { print, printHex64, lshr64, bump_timer_ticks } from "./uart.ts";
 import { handle_linux_syscall, type TrapFrame } from "./syscall.ts";
+import { alloc_page, map_user_page } from "./mmu.ts";
 
 /**
  * Installs the exception vector table by setting VBAR_EL1.
@@ -54,6 +55,24 @@ function handle_lower_sync_exception(frame_ptr: bigint): void {
 	if (ec === 0x15n) {
 		// AArch64 SVC (Linux System Call)
 		handle_linux_syscall(frame_ptr);
+	} else if (ec === 0x24n) {
+		// Data Abort from Lower EL (Page fault)
+		const far = frame.far;
+		// User stack region: 0x18000000 .. 0x20000000 (auto-grow user stack)
+		if (far >= 0x18000000n && far < 0x20000000n) {
+			const fault_page = far & ~0xfffn;
+			map_user_page(fault_page, alloc_page(), true, false);
+			return;
+		}
+
+		print("\n[tsos] Userspace Exception (EC=0x");
+		printHex64(ec);
+		print(" at PC=0x");
+		printHex64(elr);
+		print(" FAR=0x");
+		printHex64(far);
+		print(")! Halting process.\n");
+		while (true) {}
 	} else {
 		const far = frame.far;
 		print("\n[tsos] Userspace Exception (EC=0x");
@@ -79,6 +98,7 @@ function handle_irq_exception(frame_ptr: bigint): bigint {
 		// Physical timer PPI: reload timer for 50ms
 		const freq = inline_asm<u64>("mrs $0, cntfrq_el0", "=r");
 		inline_asm("msr cntp_tval_el0, $0", "r", freq / 20n);
+		bump_timer_ticks();
 	}
 
 	inline_asm("msr icc_eoir1_el1, $0", "r", iar);

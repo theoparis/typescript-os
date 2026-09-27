@@ -17,9 +17,9 @@ import {
 import { alloc_page } from "./mmu.ts";
 import {
     ext2_init,
-    ext2_lookup_path,
     ext2_read_data,
     ext2_read_inode_info,
+    ext2_getdents,
 } from "./ext2.ts";
 
 export const MAX_FDS = 32n;
@@ -38,11 +38,49 @@ export const MAX_FDS = 32n;
 // Total per FD: 160 bytes
 const FD_ENTRY_SIZE = 160n;
 
-let fd_table_buf: bigint = 0n;
+export let current_vfs_proc: u32 = 1 as u32;
+let proc_fd_tables: bigint = 0n;
 let scratch_inode: bigint = 0n;
+let saved_termios_buf: bigint = 0n;
 
+export function vfs_tcgets(arg: bigint): void {
+    if (saved_termios_buf === 0n) return;
+    if (arg !== 0n) {
+        for (let i = 0n; i < 48n; i = i + 1n) {
+            poke8(arg + i, peek8(saved_termios_buf + i));
+        }
+    }
+}
+
+export function vfs_tcsets(arg: bigint): void {
+    if (saved_termios_buf === 0n) return;
+    if (arg !== 0n) {
+        for (let i = 0n; i < 48n; i = i + 1n) {
+            poke8(saved_termios_buf + i, peek8(arg + i));
+        }
+    }
+}
+
+function tty_is_echo(): boolean {
+    if (saved_termios_buf === 0n) return true;
+    return (peek32(saved_termios_buf + 12n) & (0x08 as u32)) !== (0 as u32);
+}
+
+function tty_is_canon(): boolean {
+    if (saved_termios_buf === 0n) return true;
+    return (peek32(saved_termios_buf + 12n) & (0x02 as u32)) !== (0 as u32);
+}
 function get_fd_ptr(fd: u64): bigint {
-    return fd_table_buf + fd * FD_ENTRY_SIZE;
+    const table_base = proc_fd_tables + (current_vfs_proc as bigint) * 4096n;
+    return table_base + fd * FD_ENTRY_SIZE;
+}
+
+export function vfs_clone_proc_fds(src_proc: u32, dst_proc: u32): void {
+    const src_base = proc_fd_tables + (src_proc as bigint) * 4096n;
+    const dst_base = proc_fd_tables + (dst_proc as bigint) * 4096n;
+    for (let i = 0n; i < 512n; i = i + 1n) {
+        poke64(dst_base + i * 8n, peek64(src_base + i * 8n));
+    }
 }
 
 /**
@@ -51,13 +89,19 @@ function get_fd_ptr(fd: u64): bigint {
 export function vfs_init(): boolean {
     print("[vfs] Initializing Virtual File System...\n");
 
-    fd_table_buf = alloc_page();
+    proc_fd_tables = alloc_page();
+    alloc_page();
+    alloc_page();
+    alloc_page();
     scratch_inode = alloc_page();
 
-    // Zero out file descriptor table
+    // Zero out process 1 file descriptor table
+    const p1_table = proc_fd_tables + 1n * 4096n;
     for (let i = 0n; i < 512n; i = i + 1n) {
-        poke64(fd_table_buf + i * 8n, 0n);
+        poke64(p1_table + i * 8n, 0n);
     }
+
+    current_vfs_proc = 1 as u32;
 
     // Set up FD 0 (stdin): TTY
     const fd0 = get_fd_ptr(0n);
@@ -74,6 +118,13 @@ export function vfs_init(): boolean {
     poke8(fd2 + 0n, 1 as u8); // used
     poke8(fd2 + 1n, 1 as u8); // TTY
 
+    saved_termios_buf = alloc_page();
+    for (let i = 0n; i < 48n; i = i + 1n) poke8(saved_termios_buf + i, 0 as u8);
+    poke32(saved_termios_buf + 0n, 0x4500 as u32); // c_iflag
+    poke32(saved_termios_buf + 4n, 0x0005 as u32); // c_oflag
+    poke32(saved_termios_buf + 8n, 0x00bf as u32); // c_cflag
+    poke32(saved_termios_buf + 12n, 0x8a3b as u32); // c_lflag
+
     // Mount Ext2 root filesystem
     if (!ext2_init()) {
         print("[vfs] Warning: Failed to mount root filesystem!\n");
@@ -88,6 +139,23 @@ export function vfs_init(): boolean {
  * Opens a file by path and returns a file descriptor number or negative error code.
  */
 export function vfs_open(path: string, flags: u32, mode: u32): number {
+    const p = <Ref<u8>>(<Opaque>path);
+    if (Deref(p[0n]) === (47 as u8) && Deref(p[1n]) === (100 as u8) && Deref(p[2n]) === (101 as u8) && Deref(p[3n]) === (118 as u8) && Deref(p[4n]) === (47 as u8) && Deref(p[5n]) === (116 as u8) && Deref(p[6n]) === (116 as u8) && Deref(p[7n]) === (121 as u8) && Deref(p[8n]) === (0 as u8)) {
+        let free_fd: u64 = 0n;
+        for (let i = 3n; i < MAX_FDS; i = i + 1n) {
+            if (peek8(get_fd_ptr(i) + 0n) === (0 as u8)) {
+                free_fd = i;
+                break;
+            }
+        }
+        if (free_fd === 0n) return -24;
+        const fd_ptr = get_fd_ptr(free_fd);
+        poke8(fd_ptr + 0n, 1 as u8); // used
+        poke8(fd_ptr + 1n, 1 as u8); // TTY
+        poke32(fd_ptr + 4n, flags);
+        return free_fd as number;
+    }
+
     // Look up path in root filesystem
     if (!ext2_lookup_path(path, scratch_inode)) {
         return -2; // -ENOENT
@@ -199,6 +267,49 @@ export function vfs_dup2(oldfd: number, newfd: number): number {
     return newfd;
 }
 
+let pipe_buf: bigint = 0n;
+let pipe_read_pos: u64 = 0n;
+let pipe_write_pos: u64 = 0n;
+
+/**
+ * Creates a pipe pair: pipefd[0] is read end, pipefd[1] is write end.
+ */
+export function vfs_pipe2(pipefd_ptr: bigint, flags: u32): number {
+    if (pipe_buf === 0n) {
+        pipe_buf = alloc_page();
+    }
+    pipe_read_pos = 0n;
+    pipe_write_pos = 0n;
+
+    let rfd: u64 = 0n;
+    let wfd: u64 = 0n;
+    for (let i = 3n; i < MAX_FDS; i = i + 1n) {
+        if (peek8(get_fd_ptr(i) + 0n) === (0 as u8)) {
+            if (rfd === 0n) {
+                rfd = i;
+            } else if (wfd === 0n) {
+                wfd = i;
+                break;
+            }
+        }
+    }
+    if (rfd === 0n || wfd === 0n) {
+        return -24; // -EMFILE
+    }
+
+    const r_ptr = get_fd_ptr(rfd);
+    poke8(r_ptr + 0n, 1 as u8); // used
+    poke8(r_ptr + 1n, 3 as u8); // fs_type = 3 (pipe_read)
+
+    const w_ptr = get_fd_ptr(wfd);
+    poke8(w_ptr + 0n, 1 as u8); // used
+    poke8(w_ptr + 1n, 4 as u8); // fs_type = 4 (pipe_write)
+
+    poke32(pipefd_ptr + 0n, rfd as u32);
+    poke32(pipefd_ptr + 4n, wfd as u32);
+    return 0;
+}
+
 /**
  * Reads from an open file descriptor at current offset, advancing offset.
  */
@@ -214,17 +325,77 @@ export function vfs_read(fd: number, dest_buf: bigint, count: u64): u64 {
 
     const fs_type = peek8(fd_ptr + 1n);
     if (fs_type === (1 as u8)) {
-        // TTY / stdin: read from UART
+        // TTY / stdin: read from UART with line discipline
         if (count === 0n) return 0n;
-        let c = getchar();
-        if (c === (4 as u8)) {
-            return 0n; // EOF
+
+        const is_canon = tty_is_canon();
+        const is_echo = tty_is_echo();
+
+        if (!is_canon) {
+            // Raw mode (e.g. Readline active):
+            // Return 1 character immediately without line buffering
+            let c = getchar();
+            if (c === (4 as u8)) {
+                return 0n; // EOF
+            }
+            if (c === (13 as u8)) {
+                c = 10 as u8; // \r -> \n
+            }
+            if (is_echo) {
+                if (c === (10 as u8)) {
+                    putchar(13 as u8); // \r
+                }
+                putchar(c);
+            }
+            poke8(dest_buf, c);
+            return 1n;
         }
-        if (c === (13 as u8)) {
-            c = 10 as u8; // \r -> \n
+
+        // Canonical mode (line-buffered with kernel echo)
+        let n: u64 = 0n;
+        while (n < count) {
+            let c = getchar();
+            if (c === (4 as u8)) {
+                if (n === 0n) return 0n;
+                break;
+            }
+            if (c === (13 as u8) || c === (10 as u8)) {
+                if (is_echo) {
+                    putchar(13 as u8);
+                    putchar(10 as u8);
+                }
+                poke8(dest_buf + n, 10 as u8);
+                n = n + 1n;
+                break;
+            }
+            if (c === (8 as u8) || c === (127 as u8)) {
+                if (n > 0n) {
+                    n = n - 1n;
+                    if (is_echo) {
+                        putchar(8 as u8);
+                        putchar(32 as u8);
+                        putchar(8 as u8);
+                    }
+                }
+                continue;
+            }
+            if (is_echo) {
+                putchar(c);
+            }
+            poke8(dest_buf + n, c);
+            n = n + 1n;
         }
-        poke8(dest_buf, c);
-        return 1n;
+        return n;
+    }
+    if (fs_type === (3 as u8)) {
+        // pipe_read
+        let n: u64 = 0n;
+        while (n < count && pipe_read_pos < pipe_write_pos) {
+            poke8(dest_buf + n, peek8(pipe_buf + (pipe_read_pos & 4095n)));
+            pipe_read_pos = pipe_read_pos + 1n;
+            n = n + 1n;
+        }
+        return n;
     }
     const offset = peek64(fd_ptr + 8n);
     const fd_inode = fd_ptr + 32n;
@@ -254,6 +425,59 @@ export function vfs_pread(fd: number, dest_buf: bigint, count: u64, offset: u64)
 
     const fd_inode = fd_ptr + 32n;
     return ext2_read_data(fd_inode, offset, count, dest_buf);
+}
+
+/**
+ * Writes to an open file descriptor.
+ */
+export function vfs_write(fd: number, src_buf: bigint, count: u64): u64 {
+    if (fd < 0 || (fd as u64) >= MAX_FDS) return -9n as u64;
+    const fd_ptr = get_fd_ptr(fd as u64);
+    if (peek8(fd_ptr + 0n) === (0 as u8)) return -9n as u64;
+
+    const fs_type = peek8(fd_ptr + 1n);
+    if (fs_type === (1 as u8)) {
+        // TTY stdout / stderr: ONLCR (translate \n to \r\n)
+        for (let i = 0n; i < count; i = i + 1n) {
+            const ch = peek8(src_buf + i);
+            if (ch === (10 as u8)) {
+                putchar(13 as u8); // \r
+            }
+            putchar(ch);
+        }
+        return count;
+    }
+    if (fs_type === (4 as u8)) {
+        // pipe_write
+        for (let i = 0n; i < count; i = i + 1n) {
+            poke8(pipe_buf + (pipe_write_pos & 4095n), peek8(src_buf + i));
+            pipe_write_pos = pipe_write_pos + 1n;
+        }
+        return count;
+    }
+    return 0n;
+}
+
+/**
+ * Reads directory entries from an open directory FD into linux_dirent64 buffer.
+ */
+export function vfs_getdents64(fd: number, dirp: bigint, count: u64): u64 {
+    if (fd < 0 || (fd as u64) >= MAX_FDS) return -9n as u64;
+    const fd_ptr = get_fd_ptr(fd as u64);
+    if (peek8(fd_ptr + 0n) === (0 as u8)) return -9n as u64;
+
+    const fs_type = peek8(fd_ptr + 1n);
+    if (fs_type !== (2 as u8)) {
+        return -20n as u64; // -ENOTDIR
+    }
+
+    const offset = peek64(fd_ptr + 8n);
+    const fd_inode = fd_ptr + 32n;
+    const new_off_buf = alloc_page();
+
+    const written = ext2_getdents(fd_inode, offset, dirp, count, new_off_buf);
+    poke64(fd_ptr + 8n, peek64(new_off_buf));
+    return written;
 }
 
 /**
@@ -341,6 +565,18 @@ export function vfs_fstat(fd: number, stat_buf: bigint): number {
  * Fills Linux AArch64 struct stat (128 bytes) by file path.
  */
 export function vfs_stat(path: string, stat_buf: bigint): number {
+    const p = <Ref<u8>>(<Opaque>path);
+    if (Deref(p[0n]) === (47 as u8) && Deref(p[1n]) === (100 as u8) && Deref(p[2n]) === (101 as u8) && Deref(p[3n]) === (118 as u8) && Deref(p[4n]) === (47 as u8) && Deref(p[5n]) === (116 as u8) && Deref(p[6n]) === (116 as u8) && Deref(p[7n]) === (121 as u8) && Deref(p[8n]) === (0 as u8)) {
+        for (let i = 0n; i < 16n; i = i + 1n) poke64(stat_buf + i * 8n, 0n);
+        poke64(stat_buf + 0n, 1n);          // st_dev
+        poke64(stat_buf + 8n, 1n);          // st_ino
+        poke32(stat_buf + 16n, 0x2190 as u32); // st_mode = S_IFCHR | 0620
+        poke32(stat_buf + 20n, 1 as u32);   // st_nlink
+        poke64(stat_buf + 32n, 0x8800n);    // st_rdev
+        poke32(stat_buf + 56n, 1024 as u32);// st_blksize
+        return 0;
+    }
+
     if (!ext2_lookup_path(path, scratch_inode)) {
         return -2; // -ENOENT
     }

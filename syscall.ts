@@ -2,13 +2,23 @@
 import {
     peek8,
     poke8,
+    peek16,
+    poke16,
     peek64,
     poke64,
     printHex64,
     putchar,
     has_char,
+    now_ticks,
 } from "./uart.ts";
-import { alloc_page, map_user_page } from "./mmu.ts";
+import {
+    alloc_page,
+    map_user_page,
+    current_root_table,
+    switch_user_root_table,
+    clone_user_address_space,
+} from "./mmu.ts";
+import { execve_load } from "./elf.ts";
 import {
     vfs_open,
     vfs_close,
@@ -19,6 +29,13 @@ import {
     vfs_stat,
     vfs_dup,
     vfs_dup2,
+    vfs_write,
+    vfs_pipe2,
+    vfs_getdents64,
+    vfs_tcgets,
+    vfs_tcsets,
+    current_vfs_proc,
+    vfs_clone_proc_fds,
 } from "./vfs.ts";
 
 export type TrapFrame = {
@@ -62,11 +79,20 @@ export type TrapFrame = {
 let user_process_exited: boolean = false;
 let user_process_exit_code: u64 = 0n;
 
+let current_proc_pid: u32 = 1 as u32;
+let child_proc_pid: u32 = 0 as u32;
+let child_proc_exit_code: u64 = 0n;
+let child_proc_exited: boolean = false;
+let parent_saved_frame: bigint = 0n;
+let parent_saved_root: bigint = 0n;
+let parent_saved_sp_el0: bigint = 0n;
+let parent_saved_brk: bigint = 0n;
+let parent_saved_mmap: bigint = 0n;
+
 let current_brk: bigint = 0x0000000021000000n;
 let next_user_mmap: bigint = 0x0000000022000000n;
 let scratch_path_buf: bigint = 0n;
 let scratch_stat_buf: bigint = 0n;
-
 function copy_string_to_user(dst_addr: bigint, src_str: string): void {
     const src = <Ref<u8>>(<Opaque>src_str);
     const dst = <Ref<u8>>(<Opaque>dst_addr);
@@ -97,50 +123,70 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
         const fd = frame.x0;
         const buf = frame.x1;
         const count = frame.x2;
-
-        if (fd === 1n || fd === 2n) {
-            const src = <Ref<u8>>(<Opaque>buf);
-            for (let i = 0n; i < count; i = i + 1n) {
-                putchar(Deref(src[i]));
+        frame.x0 = vfs_write(fd as number, buf, count);
+    } else if (syscall_nr === 65n) {
+        // sys_readv(int fd, const struct iovec *iov, int vlen)
+        const fd = frame.x0;
+        const iov = frame.x1;
+        const vlen = frame.x2;
+        let total_read: u64 = 0n;
+        for (let i = 0n; i < vlen; i = i + 1n) {
+            const base = peek64(iov + i * 16n + 0n);
+            const len  = peek64(iov + i * 16n + 8n);
+            if (len > 0n) {
+                const r = vfs_read(fd as number, base, len);
+                if (r > 0n) {
+                    total_read = total_read + r;
+                    break;
+                }
             }
         }
-        frame.x0 = count;
+        frame.x0 = total_read;
     } else if (syscall_nr === 66n) {
-        // sys_writev(int fd, const struct iovec *iov, int vlen)
         const fd = frame.x0;
         const iov = frame.x1;
         const vlen = frame.x2;
         let total_written: u64 = 0n;
-
         for (let i = 0n; i < vlen; i = i + 1n) {
             const base = peek64(iov + i * 16n + 0n);
             const len = peek64(iov + i * 16n + 8n);
-            if (fd === 1n || fd === 2n) {
-                const src = <Ref<u8>>(<Opaque>base);
-                for (let j = 0n; j < len; j = j + 1n) {
-                    putchar(Deref(src[j]));
-                }
-            }
-            total_written = total_written + len;
+            total_written = total_written + vfs_write(fd as number, base, len);
         }
         frame.x0 = total_written;
     } else if (syscall_nr === 93n || syscall_nr === 94n) {
-        // sys_exit(int error_code) / sys_exit_group(int error_code)
-        user_process_exit_code = frame.x0;
-        user_process_exited = true;
+        // sys_exit / sys_exit_group
+        if (current_proc_pid === (1 as u32)) {
+            user_process_exit_code = frame.x0;
+            user_process_exited = true;
 
-        print("[tsos] Linux process exited via syscall 0x");
-        printHex64(syscall_nr);
-        print(" with exit code: 0x");
-        printHex64(user_process_exit_code);
-        print("\n");
+            print("[tsos] Linux process exited via syscall 0x");
+            printHex64(syscall_nr);
+            print(" with exit code: 0x");
+            printHex64(user_process_exit_code);
+            print("\n");
 
-        // Divert return address to kernel_exit_landing pad
-        frame.elr = inline_asm<u64>(
-            "adrp $0, kernel_exit_landing\nadd $0, $0, :lo12:kernel_exit_landing",
-            "=r",
-        );
-        frame.spsr = 0x05n;
+            frame.elr = inline_asm<u64>(
+                "adrp $0, kernel_exit_landing\nadd $0, $0, :lo12:kernel_exit_landing",
+                "=r",
+            );
+            frame.spsr = 0x05n;
+            return;
+        } else {
+            // Child process exited: restore parent context
+            child_proc_exit_code = frame.x0;
+            child_proc_exited = true;
+            current_proc_pid = 1 as u32;
+            current_vfs_proc = 1 as u32;
+            for (let i = 0n; i < 36n; i = i + 1n) {
+                poke64(frame_ptr + i * 8n, peek64(parent_saved_frame + i * 8n));
+            }
+            inline_asm("msr sp_el0, $0", "r", parent_saved_sp_el0);
+            current_brk = parent_saved_brk;
+            next_user_mmap = parent_saved_mmap;
+
+            switch_user_root_table(parent_saved_root);
+            return;
+        }
     } else if (syscall_nr === 96n) {
         // sys_set_tid_address(int *tidptr)
         frame.x0 = 1n; // tid = 1
@@ -227,17 +273,12 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
         const arg = frame.x2;
 
         if (req === 0x5401n) {
-            // TCGETS (termios): reports standard terminal attributes so isatty() succeeds!
-            if (arg !== 0n) {
-                for (let i = 0n; i < 48n; i = i + 1n) poke8(arg + i, 0 as u8);
-                poke32(arg + 0n, 0x4500 as u32); // c_iflag
-                poke32(arg + 4n, 0x0005 as u32); // c_oflag
-                poke32(arg + 8n, 0x00bf as u32); // c_cflag
-                poke32(arg + 12n, 0x8a3b as u32); // c_lflag
-            }
+            // TCGETS (termios)
+            vfs_tcgets(arg);
             frame.x0 = 0n;
         } else if (req === 0x5402n || req === 0x5403n || req === 0x5404n) {
             // TCSETS, TCSETSW, TCSETSF
+            vfs_tcsets(arg);
             frame.x0 = 0n;
         } else if (req === 0x5413n) {
             // TIOCGWINSZ
@@ -283,6 +324,12 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
         const fd = frame.x0;
         const res = vfs_close(fd as number);
         frame.x0 = res as u64;
+    } else if (syscall_nr === 59n) {
+        // sys_pipe2(int pipefd[2], int flags)
+        const pipefd_ptr = frame.x0;
+        const flags = frame.x1;
+        const res = vfs_pipe2(pipefd_ptr, flags as u32);
+        frame.x0 = res as u64;
     } else if (syscall_nr === 63n) {
         // sys_read(int fd, void *buf, size_t count)
         const fd = frame.x0;
@@ -297,6 +344,13 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
         const whence = frame.x2;
         const new_off = vfs_lseek(fd as number, offset, whence as number);
         frame.x0 = new_off;
+    } else if (syscall_nr === 61n) {
+        // sys_getdents64(int fd, struct linux_dirent64 *dirp, size_t count)
+        const fd = frame.x0;
+        const dirp = frame.x1;
+        const count = frame.x2;
+        const res = vfs_getdents64(fd as number, dirp, count);
+        frame.x0 = res;
     } else if (syscall_nr === 79n) {
         // sys_newfstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags)
         const path_ptr = frame.x1;
@@ -321,7 +375,15 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
         frame.x0 = res as u64;
     } else if (syscall_nr === 78n) {
         // sys_readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz)
-        frame.x0 = -22n as u64; // -EINVAL
+        const path_ptr = frame.x1;
+        const buf = frame.x2;
+        const bufsiz = frame.x3;
+        if (peek8(path_ptr) === (47 as u8) && peek8(path_ptr + 1n) === (112 as u8)) {
+            copy_string_to_user(buf, "/dev/tty");
+            frame.x0 = 8n;
+        } else {
+            frame.x0 = -22n as u64; // -EINVAL
+        }
     } else if (syscall_nr === 23n) {
         // sys_dup(int oldfd)
         const oldfd = frame.x0;
@@ -334,18 +396,162 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
         const res = vfs_dup2(oldfd as number, newfd as number);
         frame.x0 = res as u64;
     } else if (syscall_nr === 72n || syscall_nr === 73n) {
-        // sys_pselect6 / sys_ppoll
-        // If monitoring readfds for stdin: poll until character is ready!
-        if (frame.x1 !== 0n) {
-            while (!has_char()) {
+        // sys_pselect6 / sys_ppoll: wait for readiness on the TTY (fd 0)
+        // with proper timeout semantics.
+        let tmo_ptr: u64 = 0n;
+        let monitors_stdin = false;
+
+        if (syscall_nr === 73n) {
+            // ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *tmo, ...)
+            const fds = frame.x0;
+            const nfds = frame.x1;
+            tmo_ptr = frame.x2;
+            for (let i = 0n; i < nfds; i = i + 1n) {
+                const pfd_fd = peek32(fds + i * 8n) as u64;
+                poke16(fds + i * 8n + 6n, 0 as u16); // Linux zeroes revents on entry
+                if (pfd_fd === 0n) {
+                    monitors_stdin = true;
+                    if (has_char()) {
+                        poke16(fds + i * 8n + 6n, 1 as u16); // POLLIN -> revents
+                    }
+                }
             }
-            frame.x0 = 1n; // 1 ready descriptor
         } else {
+            // pselect6(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, timespec *tmo, sigmask)
+            const nfds = frame.x0;
+            const readfds = frame.x1;
+            tmo_ptr = frame.x4;
+            if (readfds !== 0n && nfds > 0n && (peek64(readfds) & 1n) !== 0n) {
+                monitors_stdin = true;
+            }
+        }
+
+        if (!monitors_stdin) {
             frame.x0 = 0n;
+        } else if (has_char()) {
+            frame.x0 = 1n;
+        } else {
+            let wait_ticks: u64 = 0n;
+            let infinite = false;
+            if (tmo_ptr === 0n) {
+                infinite = true;
+            } else {
+                const tmo_sec = peek64(tmo_ptr);
+                const tmo_nsec = peek64(tmo_ptr + 8n);
+                if (tmo_sec === 0n && tmo_nsec === 0n) {
+                    wait_ticks = 0n; // poll: return immediately
+                } else {
+                    // Timer runs at 50 Hz (20 ms per tick).
+                    wait_ticks = tmo_sec * 50n + tmo_nsec / 20000000n + 1n;
+                }
+            }
+
+            if (infinite) {
+                while (!has_char()) {
+                }
+                frame.x0 = 1n;
+            } else if (wait_ticks === 0n) {
+                frame.x0 = 0n;
+            } else {
+                const deadline = now_ticks() + wait_ticks;
+                while (!has_char() && now_ticks() < deadline) {
+                }
+                frame.x0 = has_char() ? 1n : 0n;
+            }
+
+            if (frame.x0 === 0n && syscall_nr === 72n && frame.x1 !== 0n) {
+                // Report no ready descriptors (Linux clears the sets).
+                poke64(frame.x1, 0n);
+            }
         }
     } else if (syscall_nr === 154n) {
         // sys_setpgid(pid_t pid, pid_t pgid)
         frame.x0 = 0n;
+    } else if (syscall_nr === 151n || syscall_nr === 152n) {
+        // sys_setfsuid / sys_setfsgid
+        frame.x0 = 0n; // previous uid/gid 0
+    } else if (syscall_nr === 220n) {
+        // sys_clone(unsigned long flags, void *child_stack, ...)
+        const newsp = frame.x1;
+
+        if (parent_saved_frame === 0n) {
+            parent_saved_frame = alloc_page();
+        }
+
+        // Save parent trap frame
+        for (let i = 0n; i < 36n; i = i + 1n) {
+            poke64(parent_saved_frame + i * 8n, peek64(frame_ptr + i * 8n));
+        }
+        // Parent returns child PID 2
+        poke64(parent_saved_frame + 0n, 2n);
+        parent_saved_root = current_root_table;
+        parent_saved_sp_el0 = inline_asm<u64>("mrs $0, sp_el0", "=r");
+        parent_saved_brk = current_brk;
+        parent_saved_mmap = next_user_mmap;
+
+        // Clone address space for child
+        const child_root = clone_user_address_space(parent_saved_root);
+
+        current_proc_pid = 2 as u32;
+        child_proc_pid = 2 as u32;
+        child_proc_exited = false;
+        current_vfs_proc = 2 as u32;
+        vfs_clone_proc_fds(1 as u32, 2 as u32);
+
+        // Child returns 0 from clone
+        frame.x0 = 0n;
+        if (newsp !== 0n) {
+            inline_asm("msr sp_el0, $0", "r", newsp);
+        }
+
+        switch_user_root_table(child_root);
+        return;
+    } else if (syscall_nr === 221n) {
+        // sys_execve(const char *filename, char *const argv[], char *const envp[])
+        const path_ptr = frame.x0;
+        const argv_ptr = frame.x1;
+
+        let p_idx: u64 = 0n;
+        while (true) {
+            const ch = peek8(path_ptr + p_idx);
+            poke8(scratch_path_buf + p_idx, ch);
+            if (ch === (0 as u8)) break;
+            p_idx = p_idx + 1n;
+        }
+        let path_buf: bigint = scratch_path_buf;
+
+        if (peek8(scratch_path_buf) !== (47 as u8)) {
+            const bin_path = alloc_page();
+            poke8(bin_path + 0n, 47 as u8); // '/'
+            poke8(bin_path + 1n, 98 as u8); // 'b'
+            poke8(bin_path + 2n, 105 as u8); // 'i'
+            poke8(bin_path + 3n, 110 as u8); // 'n'
+            poke8(bin_path + 4n, 47 as u8); // '/'
+            for (let i = 0n; i <= p_idx; i = i + 1n) {
+                poke8(bin_path + 5n + i, peek8(scratch_path_buf + i));
+            }
+            if (vfs_stat(<string>(<Opaque>bin_path), scratch_stat_buf) === 0) {
+                path_buf = bin_path;
+            }
+        }
+
+        const ok = execve_load(<string>(<Opaque>path_buf), argv_ptr, frame_ptr);
+        if (!ok) {
+            frame.x0 = -2n as u64; // -ENOENT
+        }
+        return;
+    } else if (syscall_nr === 260n) {
+        // sys_wait4(pid_t pid, int *wstatus, int options, struct rusage *rusage)
+        const status_ptr = frame.x1;
+        if (child_proc_exited) {
+            if (status_ptr !== 0n) {
+                poke32(status_ptr, ((child_proc_exit_code & 0xffn) << 8n) as u32);
+            }
+            child_proc_exited = false;
+            frame.x0 = (child_proc_pid as u64);
+        } else {
+            frame.x0 = -10n as u64; // -ECHILD
+        }
     } else if (syscall_nr === 25n) {
         // sys_fcntl(int fd, int cmd, unsigned long arg)
         frame.x0 = 0n;

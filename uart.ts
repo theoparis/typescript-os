@@ -62,6 +62,17 @@ function has_char(): boolean {
     return (peek32(UART_BASE + 0x18n) & (0x10 as u32)) === (0 as u32);
 }
 
+// Incremented by the timer interrupt; used for syscall timeouts.
+let timer_ticks: u64 = 0n;
+
+export function bump_timer_ticks(): void {
+    timer_ticks = timer_ticks + 1n;
+}
+
+export function now_ticks(): u64 {
+    return timer_ticks;
+}
+
 function getchar(): u8 {
     while (!has_char()) {
     }

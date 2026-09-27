@@ -85,7 +85,8 @@ const FLAG_SH_INNER: u64 = 3n << 8n;
 const FLAG_UXN: u64 = shl64(1n, 54n);
 const FLAG_PXN: u64 = shl64(1n, 53n);
 
-let root_table: bigint = 0n;
+export let root_table: bigint = 0n;
+export let current_root_table: bigint = 0n;
 
 /**
  * Maps a single virtual page to a physical frame for kernel usage.
@@ -210,11 +211,11 @@ function map_user_page(
 		const l2_idx = lshr64(va, 21n) & 0x1ffn;
 		const l3_idx = lshr64(va, 12n) & 0x1ffn;
 
-		const l1_entry = peek64(root_table + l1_idx * 8n);
+		const l1_entry = peek64(current_root_table + l1_idx * 8n);
 		let l2_table: bigint = 0n;
 		if ((l1_entry & 1n) === 0n) {
 			l2_table = alloc_page();
-			poke64(root_table + l1_idx * 8n, l2_table | FLAG_TABLE);
+			poke64(current_root_table + l1_idx * 8n, l2_table | FLAG_TABLE);
 		} else {
 			l2_table = l1_entry & ~0xfffn;
 		}
@@ -331,4 +332,80 @@ function init_mmu(): void {
 	sctlr = sctlr | 0x1n | (1n << 2n) | (1n << 12n);
 	write_sctlr_el1(sctlr);
 	isb();
+	current_root_table = root_table;
+}
+
+export function switch_user_root_table(new_root: bigint): void {
+	current_root_table = new_root;
+	write_ttbr0_el1(new_root);
+	dsb_ish();
+	isb();
+	tlbi_all();
+	dsb_ish();
+	isb();
+}
+
+export function create_user_root_table(): bigint {
+	const new_root = alloc_page();
+	const new_l2_0 = alloc_page();
+
+	// Entry 0 -> new_l2_0
+	poke64(new_root + 0n, new_l2_0 | FLAG_TABLE);
+
+	// Entry 1 -> 1GB Kernel RAM (0x40000000)
+	poke64(
+		new_root + 8n,
+		0x40000000n | FLAG_AF | FLAG_SH_INNER | shl64(ATTR_NORMAL, 2n) | 0x1n,
+	);
+
+	// Copy MMIO device blocks:
+	// GIC (0x08000000 >> 21 = 64)
+	poke64(new_l2_0 + 64n * 8n, 0x08000000n | FLAG_UXN | FLAG_PXN | FLAG_AF | shl64(ATTR_DEVICE, 2n) | 0x1n);
+	// UART (0x09000000 >> 21 = 72)
+	poke64(new_l2_0 + 72n * 8n, 0x09000000n | FLAG_UXN | FLAG_PXN | FLAG_AF | shl64(ATTR_DEVICE, 2n) | 0x1n);
+	// VirtIO (0x0a000000 >> 21 = 80)
+	poke64(new_l2_0 + 80n * 8n, 0x0a000000n | FLAG_UXN | FLAG_PXN | FLAG_AF | shl64(ATTR_DEVICE, 2n) | 0x1n);
+
+	return new_root;
+}
+
+export function clone_user_address_space(parent_root: bigint): bigint {
+	const child_root = create_user_root_table();
+	const parent_l2_0 = peek64(parent_root + 0n) & ~0xfffn;
+	const child_l2_0  = peek64(child_root + 0n) & ~0xfffn;
+
+	// Iterate through all 512 entries of parent_l2_0
+	for (let e = 0n; e < 512n; e = e + 1n) {
+		// Skip kernel MMIO blocks: 64, 72, 80
+		if (e === 64n || e === 72n || e === 80n) {
+			continue;
+		}
+
+		const l2_entry = peek64(parent_l2_0 + e * 8n);
+		// If entry is valid table (FLAG_TABLE = 3)
+		if ((l2_entry & 1n) !== 0n && (l2_entry & 2n) !== 0n) {
+			const parent_l3 = l2_entry & ~0xfffn;
+			const child_l3  = alloc_page();
+			poke64(child_l2_0 + e * 8n, child_l3 | FLAG_TABLE);
+
+			// Copy all valid 4KB user pages in this L3 table
+			for (let i = 0n; i < 512n; i = i + 1n) {
+				const l3_entry = peek64(parent_l3 + i * 8n);
+				if ((l3_entry & 1n) !== 0n) {
+					const parent_pa = l3_entry & ~0xfffn;
+					const attrs = l3_entry & 0xfffn;
+					const child_pa = alloc_page();
+
+					// Deep copy 4096 bytes
+					for (let k = 0n; k < 512n; k = k + 1n) {
+						poke64(child_pa + k * 8n, peek64(parent_pa + k * 8n));
+					}
+
+					poke64(child_l3 + i * 8n, child_pa | attrs);
+				}
+			}
+		}
+	}
+
+	return child_root;
 }

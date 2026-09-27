@@ -318,6 +318,89 @@ export function ext2_lookup_dir_mem(
     return 0 as u32;
 }
 
+
+/**
+ * Reads directory entries and formats them as linux_dirent64 structures.
+ */
+export function ext2_getdents(
+    dir_inode_ptr: bigint,
+    start_off: u64,
+    out_buf: bigint,
+    max_count: u64,
+    new_off_ptr: bigint,
+): u64 {
+    const dir_size = peek64(dir_inode_ptr + 8n);
+    let offset = start_off;
+    let written_bytes: u64 = 0n;
+
+    while (offset < dir_size) {
+        const file_block = udiv64(offset, ext2_block_size);
+        const in_block_offset = offset - file_block * ext2_block_size;
+        const fs_block = ext2_bmap(dir_inode_ptr, file_block);
+
+        if (fs_block === 0n) {
+            offset = offset + ext2_block_size;
+            continue;
+        }
+
+        ext2_read_block(fs_block, ext2_block_buf);
+
+        let cur_in_blk = in_block_offset;
+        while (cur_in_blk < ext2_block_size && offset < dir_size) {
+            const entry_addr = ext2_block_buf + cur_in_blk;
+            const entry_ino = peek32(entry_addr + 0n);
+            const rec_len = peek16(entry_addr + 4n) as u64;
+            const name_len = peek8(entry_addr + 6n) as u64;
+            const file_type = peek8(entry_addr + 7n);
+
+            if (rec_len === 0n) {
+                poke64(new_off_ptr, offset);
+                return written_bytes;
+            }
+
+            if (entry_ino !== (0 as u32)) {
+                // linux_dirent64 reclen aligned to 8 bytes: 19 + name_len + 1
+                const raw_len = 19n + name_len + 1n;
+                const d_reclen = (raw_len + 7n) & ~7n;
+
+                if (written_bytes + d_reclen > max_count) {
+                    // Buffer full
+                    poke64(new_off_ptr, offset);
+                    return written_bytes;
+                }
+
+                // Map file_type to DT_*
+                let d_type: u8 = 8 as u8; // DT_REG
+                if (file_type === (2 as u8)) d_type = 4 as u8; // DT_DIR
+                else if (file_type === (7 as u8)) d_type = 10 as u8; // DT_LNK
+
+                const dst = out_buf + written_bytes;
+                poke64(dst + 0n, entry_ino as u64);
+                poke64(dst + 8n, offset + rec_len);
+                poke16(dst + 16n, d_reclen as u16);
+                poke8(dst + 18n, d_type);
+
+                for (let k = 0n; k < name_len; k = k + 1n) {
+                    poke8(dst + 19n + k, peek8(entry_addr + 8n + k));
+                }
+                poke8(dst + 19n + name_len, 0 as u8);
+
+                // Zero padding
+                for (let k = 19n + name_len + 1n; k < d_reclen; k = k + 1n) {
+                    poke8(dst + k, 0 as u8);
+                }
+
+                written_bytes = written_bytes + d_reclen;
+            }
+
+            cur_in_blk = cur_in_blk + rec_len;
+            offset = offset + rec_len;
+        }
+    }
+
+    poke64(new_off_ptr, offset);
+    return written_bytes;
+}
 /**
  * Resolves a path to an inode number, resolving intermediate symlinks and root inode (2).
  */

@@ -80,7 +80,7 @@ $(STAGE3_TAR): | $(BUILD_DIR)
 
 $(ROOTFS_IMG): $(STAGE3_TAR) | $(BUILD_DIR)
 	rm -rf $(ROOTFS_DIR)
-	mkdir -p $(ROOTFS_DIR)/usr/lib $(ROOTFS_DIR)/usr/bin $(ROOTFS_DIR)/etc
+	mkdir -p $(ROOTFS_DIR)/usr/lib $(ROOTFS_DIR)/usr/bin $(ROOTFS_DIR)/etc $(ROOTFS_DIR)/usr/share
 	tar -xf $(STAGE3_TAR) -C $(ROOTFS_DIR) \
 		./usr/lib/libc.so \
 		./usr/lib/libreadline.so.8.3 \
@@ -90,7 +90,14 @@ $(ROOTFS_IMG): $(STAGE3_TAR) | $(BUILD_DIR)
 		./usr/bin/echo \
 		./usr/bin/cat \
 		./usr/bin/uname \
-		./usr/bin/pwd 2>/dev/null || true
+		./usr/bin/pwd \
+		./usr/bin/ls \
+		./usr/bin/mkdir \
+		./usr/bin/rm \
+		./usr/share/terminfo/l/linux \
+		./usr/share/terminfo/x/xterm \
+		./usr/share/terminfo/v/vt100 \
+		./usr/share/terminfo/x/xterm-256color 2>/dev/null || true
 	ln -sf usr/lib $(ROOTFS_DIR)/lib
 	ln -sf usr/bin $(ROOTFS_DIR)/bin
 	ln -sf usr/bin $(ROOTFS_DIR)/sbin
