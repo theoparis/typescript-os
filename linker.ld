@@ -8,6 +8,6 @@ SECTIONS {
     . = ALIGN(16); /* two times pointer size */
     . += 0x4000; /* 16kB of stack memory */
     stack_top = .;
-    . = ALIGN(16384);
+    . = ALIGN(65536); /* largest supported page size (64k) */
     _kernel_end = .;
 }

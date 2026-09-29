@@ -6,17 +6,22 @@ CC := clang
 endif
 QEMU ?= qemu-system-aarch64
 
-PAGE_SIZE ?= 4k
-PAGE_SIZE_LOWER := $(shell echo $(PAGE_SIZE) | tr '[:upper:]' '[:lower:]')
+# The page size comes from config.ts (`cp config.example.ts config.ts`).
+CONFIG_TS := config.ts
+ifeq ($(wildcard $(CONFIG_TS)),)
+$(error $(CONFIG_TS) not found. Run: cp config.example.ts config.ts)
+endif
+PAGE_SIZE := $(shell sed -n 's/^export const page_size[^=]*= *\([0-9]*\)n\{0,1\};.*/\1/p' $(CONFIG_TS))
 
-ifeq ($(PAGE_SIZE_LOWER),16k)
-CONFIG_PAGE_SIZE_16K := true
-QEMU_CPU ?= cortex-a76
-else ifeq ($(PAGE_SIZE_LOWER),4k)
-CONFIG_PAGE_SIZE_16K := false
+# cortex-a53 has no 16KB granule support; use a76 for anything but 4KB.
+ifeq ($(PAGE_SIZE),4096)
 QEMU_CPU ?= cortex-a53
+else ifeq ($(PAGE_SIZE),16384)
+QEMU_CPU ?= cortex-a76
+else ifeq ($(PAGE_SIZE),65536)
+QEMU_CPU ?= cortex-a76
 else
-$(error Invalid PAGE_SIZE '$(PAGE_SIZE)'. Supported values: 4k, 16k)
+$(error Invalid page_size '$(PAGE_SIZE)' in $(CONFIG_TS). Supported values: 4096, 16384, 65536)
 endif
 
 BUILD_DIR ?= build
@@ -28,7 +33,7 @@ ASFLAGS ?= --target=$(TARGET_TRIPLE)
 LDFLAGS ?= -fuse-ld=lld -nostdlib -T$(LINKER_SCRIPT) --target=$(TARGET_TRIPLE)
 ROOTFS_IMG ?= $(BUILD_DIR)/rootfs.img
 ROOTFS_DIR ?= $(BUILD_DIR)/rootfs
-QEMUFLAGS ?= -M virt,gic-version=3 -cpu $(QEMU_CPU) -nographic \
+QEMUFLAGS ?= -M virt,gic-version=3 -cpu $(QEMU_CPU) -m 512M -nographic \
 	-drive file=$(ROOTFS_IMG),if=none,format=raw,id=hd0 \
 	-device virtio-blk-device,drive=hd0
 
@@ -47,7 +52,6 @@ OBJS := \
 	$(BUILD_DIR)/elf.o \
 	$(BUILD_DIR)/exceptions.o \
 	$(BUILD_DIR)/kmain.o
-CONFIG_TS := $(BUILD_DIR)/config.ts
 USER_ELF := $(BUILD_DIR)/init.elf
 
 export PATH := $(HOME)/src/TypeScriptCompiler/build/bin:$(PATH)
@@ -112,19 +116,12 @@ $(ROOTFS_IMG): $(STAGE3_TAR) | $(BUILD_DIR)
 	echo 'NAME="tsos"' > $(ROOTFS_DIR)/etc/os-release
 	echo 'Hello from Gentoo musl rootfs in tsos!' > $(ROOTFS_DIR)/hello.txt
 	mke2fs -q -F -t ext2 -d $(ROOTFS_DIR) $@ 32M
-$(CONFIG_TS): FORCE | $(BUILD_DIR)
-	@echo "// Auto-generated configuration" > $@.tmp; \
-	echo "export const use_16k: boolean = $(CONFIG_PAGE_SIZE_16K);" >> $@.tmp; \
-	if ! cmp -s $@.tmp $@ 2>/dev/null; then \
-		mv $@.tmp $@; \
-	else \
-		rm -f $@.tmp; \
-	fi
 
 $(BUILD_DIR)/config.o: $(CONFIG_TS) | $(BUILD_DIR)
 	$(TSLANG) $(TSFLAGS) -o $@ $<
 
-$(BUILD_DIR)/%.o: %.ts | $(BUILD_DIR)
+# Every module may import config.ts
+$(BUILD_DIR)/%.o: %.ts $(CONFIG_TS) | $(BUILD_DIR)
 	$(TSLANG) $(TSFLAGS) -o $@ $<
 
 $(BUILD_DIR)/%.o: %.s | $(BUILD_DIR)

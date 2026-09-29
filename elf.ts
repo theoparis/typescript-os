@@ -13,6 +13,10 @@ import {
 } from "./uart.ts";
 import {
     alloc_page,
+    lookup_user_page,
+    get_page_size,
+    get_page_mask,
+    get_page_shift,
     map_user_page,
     create_user_root_table,
     switch_user_root_table,
@@ -78,7 +82,7 @@ export function load_and_run_elf_file(
     const file_size = peek64(stat_page + 48n);
 
     // Allocate contiguous buffer to hold the executable
-    const num_pages = (file_size + 4095n) >> 12n;
+    const num_pages = (file_size + get_page_mask()) >> get_page_shift();
     const exec_buf = alloc_page();
     for (let i = 1n; i < num_pages; i = i + 1n) {
         alloc_page();
@@ -153,22 +157,28 @@ export function load_and_run_elf_file(
             const is_write = (p_flags & (2 as u32)) !== (0 as u32);
             const is_exec = (p_flags & (1 as u32)) !== (0 as u32);
 
-            const va_start = (main_base + p_vaddr) & ~0xfffn;
-            const va_end = (main_base + p_vaddr + p_memsz + 4095n) & ~0xfffn;
+            const va_start = (main_base + p_vaddr) & ~get_page_mask();
+            const va_end = (main_base + p_vaddr + p_memsz + get_page_mask()) & ~get_page_mask();
 
-            for (let v = va_start; v < va_end; v = v + 4096n) {
-                const phys = alloc_page();
-                for (let off = 0n; off < 4096n; off = off + 1n) {
-                    const curr_va = v + off;
-                    if (curr_va >= main_base + p_vaddr && curr_va < main_base + p_vaddr + p_filesz) {
-                        const file_off = p_offset + (curr_va - (main_base + p_vaddr));
-                        poke8(phys + off, peek8(exec_buf + file_off));
-                    } else {
-                        poke8(phys + off, 0 as u8);
-                    }
+            for (let v = va_start; v < va_end; v = v + get_page_size()) {
+                let phys = lookup_user_page(v);
+                let seg_write = is_write;
+                let seg_exec = is_exec;
+                if (phys === 0n) {
+                    phys = alloc_page(); // zeroed
+                } else {
+                    // Page shared with a previous segment: keep both segments usable
+                    seg_write = true;
+                    seg_exec = true;
                 }
-                // Map page (writable if requested, or if executable)
-                map_user_page(v, phys, is_write, is_exec);
+                const seg_lo = main_base + p_vaddr;
+                const seg_hi = seg_lo + p_filesz;
+                const copy_lo = v > seg_lo ? v : seg_lo;
+                const copy_hi = (v + get_page_size()) < seg_hi ? (v + get_page_size()) : seg_hi;
+                for (let c = copy_lo; c < copy_hi; c = c + 1n) {
+                    poke8(phys + (c - v), peek8(exec_buf + p_offset + (c - seg_lo)));
+                }
+                map_user_page(v, phys, seg_write, seg_exec);
             }
         }
     }
@@ -209,7 +219,7 @@ export function load_and_run_elf_file(
         vfs_fstat(ifd, stat_page);
         const interp_size = peek64(stat_page + 48n);
 
-        const interp_pages = (interp_size + 4095n) >> 12n;
+        const interp_pages = (interp_size + get_page_mask()) >> get_page_shift();
         const interp_buf = alloc_page();
         for (let i = 1n; i < interp_pages; i = i + 1n) {
             alloc_page();
@@ -247,28 +257,35 @@ export function load_and_run_elf_file(
                 const is_write = (p_flags & (2 as u32)) !== (0 as u32);
                 const is_exec = (p_flags & (1 as u32)) !== (0 as u32);
 
-                const va_start = (interp_base + p_vaddr) & ~0xfffn;
-                const va_end = (interp_base + p_vaddr + p_memsz + 4095n) & ~0xfffn;
+                const va_start = (interp_base + p_vaddr) & ~get_page_mask();
+                const va_end = (interp_base + p_vaddr + p_memsz + get_page_mask()) & ~get_page_mask();
 
-                for (let v = va_start; v < va_end; v = v + 4096n) {
-                    const phys = alloc_page();
-                    for (let off = 0n; off < 4096n; off = off + 1n) {
-                        const curr_va = v + off;
-                        if (curr_va >= interp_base + p_vaddr && curr_va < interp_base + p_vaddr + p_filesz) {
-                            const file_off = p_offset + (curr_va - (interp_base + p_vaddr));
-                            poke8(phys + off, peek8(interp_buf + file_off));
-                        } else {
-                            poke8(phys + off, 0 as u8);
-                        }
+                for (let v = va_start; v < va_end; v = v + get_page_size()) {
+                    let phys = lookup_user_page(v);
+                    let seg_write = is_write;
+                    let seg_exec = is_exec;
+                    if (phys === 0n) {
+                        phys = alloc_page(); // zeroed
+                    } else {
+                        // Page shared with a previous segment: keep both segments usable
+                        seg_write = true;
+                        seg_exec = true;
                     }
-                    map_user_page(v, phys, is_write, is_exec);
+                    const seg_lo = interp_base + p_vaddr;
+                    const seg_hi = seg_lo + p_filesz;
+                    const copy_lo = v > seg_lo ? v : seg_lo;
+                    const copy_hi = (v + get_page_size()) < seg_hi ? (v + get_page_size()) : seg_hi;
+                    for (let c = copy_lo; c < copy_hi; c = c + 1n) {
+                        poke8(phys + (c - v), peek8(interp_buf + p_offset + (c - seg_lo)));
+                    }
+                    map_user_page(v, phys, seg_write, seg_exec);
                 }
             }
         }
     }
 
     // Allocate and map User Stack (64KB at USER_STACK_TOP)
-    for (let p = USER_STACK_TOP - 65536n; p < USER_STACK_TOP; p = p + 4096n) {
+    for (let p = USER_STACK_TOP - 65536n; p < USER_STACK_TOP; p = p + get_page_size()) {
         map_user_page(p, alloc_page(), true, false);
     }
 
@@ -331,7 +348,7 @@ export function load_and_run_elf_file(
     poke64(auxv_base + 0n, 3n); poke64(auxv_base + 8n, at_phdr);
     poke64(auxv_base + 16n, 4n); poke64(auxv_base + 24n, e_phentsize);
     poke64(auxv_base + 32n, 5n); poke64(auxv_base + 40n, e_phnum);
-    poke64(auxv_base + 48n, 6n); poke64(auxv_base + 56n, 4096n);
+    poke64(auxv_base + 48n, 6n); poke64(auxv_base + 56n, get_page_size());
     poke64(auxv_base + 64n, 7n); poke64(auxv_base + 72n, has_interp ? interp_base : 0n);
     poke64(auxv_base + 80n, 8n); poke64(auxv_base + 88n, 0n);
     poke64(auxv_base + 96n, 9n); poke64(auxv_base + 104n, main_entry);
@@ -405,7 +422,7 @@ export function execve_load(
     vfs_fstat(fd, stat_page);
     const file_size = peek64(stat_page + 48n);
 
-    const num_pages = (file_size + 4095n) >> 12n;
+    const num_pages = (file_size + get_page_mask()) >> get_page_shift();
     const exec_buf = alloc_page();
     for (let i = 1n; i < num_pages; i = i + 1n) {
         alloc_page();
@@ -460,21 +477,28 @@ export function execve_load(
             const is_write = (p_flags & (2 as u32)) !== (0 as u32);
             const is_exec = (p_flags & (1 as u32)) !== (0 as u32);
 
-            const va_start = (main_base + p_vaddr) & ~0xfffn;
-            const va_end = (main_base + p_vaddr + p_memsz + 4095n) & ~0xfffn;
+            const va_start = (main_base + p_vaddr) & ~get_page_mask();
+            const va_end = (main_base + p_vaddr + p_memsz + get_page_mask()) & ~get_page_mask();
 
-            for (let v = va_start; v < va_end; v = v + 4096n) {
-                const phys = alloc_page();
-                for (let off = 0n; off < 4096n; off = off + 1n) {
-                    const curr_va = v + off;
-                    if (curr_va >= main_base + p_vaddr && curr_va < main_base + p_vaddr + p_filesz) {
-                        const file_off = p_offset + (curr_va - (main_base + p_vaddr));
-                        poke8(phys + off, peek8(exec_buf + file_off));
-                    } else {
-                        poke8(phys + off, 0 as u8);
-                    }
+            for (let v = va_start; v < va_end; v = v + get_page_size()) {
+                let phys = lookup_user_page(v);
+                let seg_write = is_write;
+                let seg_exec = is_exec;
+                if (phys === 0n) {
+                    phys = alloc_page(); // zeroed
+                } else {
+                    // Page shared with a previous segment: keep both segments usable
+                    seg_write = true;
+                    seg_exec = true;
                 }
-                map_user_page(v, phys, is_write, is_exec);
+                const seg_lo = main_base + p_vaddr;
+                const seg_hi = seg_lo + p_filesz;
+                const copy_lo = v > seg_lo ? v : seg_lo;
+                const copy_hi = (v + get_page_size()) < seg_hi ? (v + get_page_size()) : seg_hi;
+                for (let c = copy_lo; c < copy_hi; c = c + 1n) {
+                    poke8(phys + (c - v), peek8(exec_buf + p_offset + (c - seg_lo)));
+                }
+                map_user_page(v, phys, seg_write, seg_exec);
             }
         }
     }
@@ -498,7 +522,7 @@ export function execve_load(
         if (ifd >= 0) {
             vfs_fstat(ifd, stat_page);
             const interp_size = peek64(stat_page + 48n);
-            const interp_pages = (interp_size + 4095n) >> 12n;
+            const interp_pages = (interp_size + get_page_mask()) >> get_page_shift();
             const interp_buf = alloc_page();
             for (let i = 1n; i < interp_pages; i = i + 1n) alloc_page();
 
@@ -522,21 +546,28 @@ export function execve_load(
                     const is_write = (p_flags & (2 as u32)) !== (0 as u32);
                     const is_exec = (p_flags & (1 as u32)) !== (0 as u32);
 
-                    const va_start = (interp_base + p_vaddr) & ~0xfffn;
-                    const va_end = (interp_base + p_vaddr + p_memsz + 4095n) & ~0xfffn;
+                    const va_start = (interp_base + p_vaddr) & ~get_page_mask();
+                    const va_end = (interp_base + p_vaddr + p_memsz + get_page_mask()) & ~get_page_mask();
 
-                    for (let v = va_start; v < va_end; v = v + 4096n) {
-                        const phys = alloc_page();
-                        for (let off = 0n; off < 4096n; off = off + 1n) {
-                            const curr_va = v + off;
-                            if (curr_va >= interp_base + p_vaddr && curr_va < interp_base + p_vaddr + p_filesz) {
-                                const file_off = p_offset + (curr_va - (interp_base + p_vaddr));
-                                poke8(phys + off, peek8(interp_buf + file_off));
-                            } else {
-                                poke8(phys + off, 0 as u8);
-                            }
+                    for (let v = va_start; v < va_end; v = v + get_page_size()) {
+                        let phys = lookup_user_page(v);
+                        let seg_write = is_write;
+                        let seg_exec = is_exec;
+                        if (phys === 0n) {
+                            phys = alloc_page(); // zeroed
+                        } else {
+                            // Page shared with a previous segment: keep both segments usable
+                            seg_write = true;
+                            seg_exec = true;
                         }
-                        map_user_page(v, phys, is_write, is_exec);
+                        const seg_lo = interp_base + p_vaddr;
+                        const seg_hi = seg_lo + p_filesz;
+                        const copy_lo = v > seg_lo ? v : seg_lo;
+                        const copy_hi = (v + get_page_size()) < seg_hi ? (v + get_page_size()) : seg_hi;
+                        for (let c = copy_lo; c < copy_hi; c = c + 1n) {
+                            poke8(phys + (c - v), peek8(interp_buf + p_offset + (c - seg_lo)));
+                        }
+                        map_user_page(v, phys, seg_write, seg_exec);
                     }
                 }
             }
@@ -544,7 +575,7 @@ export function execve_load(
     }
 
     // 4. Map User Stack (64KB at USER_STACK_TOP)
-    for (let p = USER_STACK_TOP - 65536n; p < USER_STACK_TOP; p = p + 4096n) {
+    for (let p = USER_STACK_TOP - 65536n; p < USER_STACK_TOP; p = p + get_page_size()) {
         map_user_page(p, alloc_page(), true, false);
     }
 
@@ -588,7 +619,7 @@ export function execve_load(
     poke64(auxv_base + 0n, 3n); poke64(auxv_base + 8n, at_phdr);
     poke64(auxv_base + 16n, 4n); poke64(auxv_base + 24n, e_phentsize);
     poke64(auxv_base + 32n, 5n); poke64(auxv_base + 40n, e_phnum);
-    poke64(auxv_base + 48n, 6n); poke64(auxv_base + 56n, 4096n);
+    poke64(auxv_base + 48n, 6n); poke64(auxv_base + 56n, get_page_size());
     poke64(auxv_base + 64n, 7n); poke64(auxv_base + 72n, has_interp ? interp_base : 0n);
     poke64(auxv_base + 80n, 8n); poke64(auxv_base + 88n, 0n);
     poke64(auxv_base + 96n, 9n); poke64(auxv_base + 104n, main_entry);

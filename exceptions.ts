@@ -1,7 +1,7 @@
 // AArch64 Exception and Interrupt Dispatcher
 import { print, printHex64, lshr64, bump_timer_ticks } from "./uart.ts";
 import { handle_linux_syscall, type TrapFrame } from "./syscall.ts";
-import { alloc_page, map_user_page } from "./mmu.ts";
+import { alloc_page, map_user_page, get_page_mask } from "./mmu.ts";
 
 /**
  * Installs the exception vector table by setting VBAR_EL1.
@@ -60,7 +60,7 @@ function handle_lower_sync_exception(frame_ptr: bigint): void {
 		const far = frame.far;
 		// User stack region: 0x18000000 .. 0x20000000 (auto-grow user stack)
 		if (far >= 0x18000000n && far < 0x20000000n) {
-			const fault_page = far & ~0xfffn;
+			const fault_page = far & ~get_page_mask();
 			map_user_page(fault_page, alloc_page(), true, false);
 			return;
 		}
@@ -69,6 +69,8 @@ function handle_lower_sync_exception(frame_ptr: bigint): void {
 		printHex64(ec);
 		print(" at PC=0x");
 		printHex64(elr);
+		print(" ESR=0x");
+		printHex64(esr);
 		print(" FAR=0x");
 		printHex64(far);
 		print(")! Halting process.\n");
@@ -79,6 +81,8 @@ function handle_lower_sync_exception(frame_ptr: bigint): void {
 		printHex64(ec);
 		print(" at PC=0x");
 		printHex64(elr);
+		print(" ESR=0x");
+		printHex64(esr);
 		print(" FAR=0x");
 		printHex64(far);
 		print(")! Halting process.\n");

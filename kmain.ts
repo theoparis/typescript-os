@@ -1,8 +1,9 @@
 // Kernel Main Entry Point for tsos (AArch64)
-import * as config from "./build/config.ts";
+import * as config from "./config.ts";
 import { load_and_run_elf_file } from "./elf.ts";
 import { init_exceptions } from "./exceptions.ts";
 import { init_gicv3 } from "./gic.ts";
+import { init_mmu, is_valid_page_size } from "./mmu.ts";
 import { virtio_blk_init } from "./virtio.ts";
 import { vfs_init } from "./vfs.ts";
 
@@ -27,10 +28,14 @@ function kernel_exit_landing(): void {
  * Main kernel entry point called from boot.s.
  */
 function kmain(): void {
-	if (config.use_16k) {
-		print(
-			"[tsos] Booting kernel with 16KB page granule (Apple Silicon compatible)...\n",
-		);
+	if (!is_valid_page_size()) {
+		print("[tsos] Fatal: config.page_size must be 4096, 16384 or 65536!\n");
+		while (true) inline_asm("wfi", "");
+	}
+	if (config.page_size === 65536n) {
+		print("[tsos] Booting kernel with 64KB page granule...\n");
+	} else if (config.page_size === 16384n) {
+		print("[tsos] Booting kernel with 16KB page granule (Apple Silicon compatible)...\n");
 	} else {
 		print("[tsos] Booting kernel with 4KB page granule...\n");
 	}

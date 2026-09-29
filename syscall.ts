@@ -13,6 +13,8 @@ import {
 } from "./uart.ts";
 import {
     alloc_page,
+    get_page_size,
+    get_page_mask,
     map_user_page,
     current_root_table,
     switch_user_root_table,
@@ -215,9 +217,9 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
         // sys_brk(unsigned long brk)
         const req_brk = frame.x0;
         if (req_brk !== 0n && req_brk >= current_brk) {
-            const old_aligned = (current_brk + 4095n) & ~4095n;
-            const new_aligned = (req_brk + 4095n) & ~4095n;
-            for (let v = old_aligned; v < new_aligned; v = v + 4096n) {
+            const old_aligned = (current_brk + get_page_mask()) & ~get_page_mask();
+            const new_aligned = (req_brk + get_page_mask()) & ~get_page_mask();
+            for (let v = old_aligned; v < new_aligned; v = v + get_page_size()) {
                 map_user_page(v, alloc_page(), true, false);
             }
             current_brk = req_brk;
@@ -239,7 +241,7 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
         const is_fixed = (flags & 0x10n) !== 0n; // MAP_FIXED
         if (!is_fixed && (target_va === 0n || target_va < 0x01000000n)) {
             target_va = next_user_mmap;
-            const aligned_len = (length + 4095n) & ~4095n;
+            const aligned_len = (length + get_page_mask()) & ~get_page_mask();
             next_user_mmap = next_user_mmap + aligned_len;
         }
 
@@ -247,17 +249,14 @@ export function handle_linux_syscall(frame_ptr: bigint): void {
         const is_exec  = (prot & 4n) !== 0n;
         const is_anon  = (flags & 0x20n) !== 0n; // MAP_ANONYMOUS
 
-        const va_start = target_va & ~4095n;
-        const va_end   = (target_va + length + 4095n) & ~4095n;
+        const va_start = target_va & ~get_page_mask();
+        const va_end   = (target_va + length + get_page_mask()) & ~get_page_mask();
 
-        for (let v = va_start; v < va_end; v = v + 4096n) {
+        for (let v = va_start; v < va_end; v = v + get_page_size()) {
             const phys = alloc_page();
-            for (let i = 0n; i < 512n; i = i + 1n) {
-                poke64(phys + i * 8n, 0n);
-            }
             if (!is_anon && (fd as number) >= 0) {
                 const file_off = offset + (v - va_start);
-                vfs_pread(fd as number, phys, 4096n, file_off);
+                vfs_pread(fd as number, phys, get_page_size(), file_off);
             }
             map_user_page(v, phys, is_write, is_exec);
         }

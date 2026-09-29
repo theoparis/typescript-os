@@ -1,6 +1,6 @@
-// AArch64 MMU Setup and Paging (supporting 4KB and 16KB granules)
+// AArch64 MMU Setup and Paging (supporting 4KB, 16KB and 64KB granules)
 import { shl64 } from "./uart.ts";
-import * as config from "./build/config.ts";
+import * as config from "./config.ts";
 
 function isb(): void {
 	inline_asm("isb", "");
@@ -14,8 +14,9 @@ function tlbi_all(): void {
 	inline_asm("tlbi vmalle1is", "");
 }
 
-function tlbi_va(va_page: u64): void {
-	inline_asm("tlbi vaae1is, $0", "r", va_page);
+// TLBI VAAE1IS takes VA[55:12] regardless of the translation granule.
+function tlbi_va(va: u64): void {
+	inline_asm("tlbi vaae1is, $0", "r", lshr64(va, 12n));
 }
 
 function write_mair_el1(val: u64): void {
@@ -45,30 +46,79 @@ function get_kernel_end(): bigint {
 	);
 }
 
+// --- Page size configuration ---
+//
+// config.page_size selects the translation granule: 4096, 16384 or 65536.
+//
+//   granule | VA bits | root level (entries, shift) | levels
+//   --------+---------+-----------------------------+-------
+//   4KB     | 39      | L1 (512, 30)                | L1 -> L2 -> L3
+//   16KB    | 36      | L2 (2048, 25)               | L2 -> L3
+//   64KB    | 36      | L2 (128, 29)                | L2 -> L3
+
+export function get_page_size(): bigint {
+	return config.page_size;
+}
+
+export function get_page_mask(): bigint {
+	return config.page_size - 1n;
+}
+export function get_page_shift(): bigint {
+	if (config.page_size === 65536n) return 16n;
+	if (config.page_size === 16384n) return 14n;
+	return 12n;
+}
+
+// Output-address bits of a descriptor: [47:get_page_shift()]
+function addr_mask(): bigint {
+	return 0x0000fffffffff000n & ~(config.page_size - 1n);
+}
+
+function root_shift(): bigint {
+	if (get_page_size() === 65536n) return 29n;
+	if (get_page_size() === 16384n) return 25n;
+	return 30n;
+}
+
+function root_index_mask(): bigint {
+	if (get_page_size() === 65536n) return 0x7fn;
+	if (get_page_size() === 16384n) return 0x7ffn;
+	return 0x1ffn;
+}
+
+// Number of 8-byte entries in a full table (one page)
+function table_entries(): bigint {
+	return get_page_size() / 8n;
+}
+
+export function is_valid_page_size(): boolean {
+	return (
+		config.page_size === 4096n ||
+		config.page_size === 16384n ||
+		config.page_size === 65536n
+	);
+}
+
 // --- Page Allocator ---
 
 let next_free_page: bigint = 0n;
 
 function init_allocator(): void {
 	next_free_page = get_kernel_end();
-	const align_mask = 16383n;
-	if ((next_free_page & align_mask) !== 0n) {
-		next_free_page = (next_free_page + 16384n) & ~align_mask;
+	if ((next_free_page & get_page_mask()) !== 0n) {
+		next_free_page = (next_free_page + get_page_size()) & ~get_page_mask();
 	}
 }
 
-function alloc_page(): bigint {
+/**
+ * Allocates one zeroed, page-aligned page (get_page_size() bytes).
+ */
+export function alloc_page(): bigint {
 	const page = next_free_page;
-	if (config.use_16k) {
-		next_free_page = next_free_page + 16384n;
-		for (let i = 0n; i < 2048n; i = i + 1n) {
-			poke64(page + i * 8n, 0n);
-		}
-	} else {
-		next_free_page = next_free_page + 4096n;
-		for (let i = 0n; i < 512n; i = i + 1n) {
-			poke64(page + i * 8n, 0n);
-		}
+	next_free_page = next_free_page + get_page_size();
+	const n = table_entries();
+	for (let i = 0n; i < n; i = i + 1n) {
+		poke64(page + i * 8n, 0n);
 	}
 	return page;
 }
@@ -84,77 +134,98 @@ const FLAG_AF: u64 = 1n << 10n;
 const FLAG_SH_INNER: u64 = 3n << 8n;
 const FLAG_UXN: u64 = shl64(1n, 54n);
 const FLAG_PXN: u64 = shl64(1n, 53n);
+const FLAG_AP_EL0: u64 = 0x40n; // AP[1] (bit 6): accessible from EL0
 
 export let root_table: bigint = 0n;
 export let current_root_table: bigint = 0n;
+
+// --- Page table walking ---
+
+/**
+ * Returns the table referenced by entry `idx` of `table`, allocating it if
+ * `create` is set. Returns 0 if absent.
+ */
+function next_table(table: bigint, idx: bigint, create: boolean): bigint {
+	const entry = peek64(table + idx * 8n);
+	if ((entry & 1n) === 0n) {
+		if (!create) {
+			return 0n;
+		}
+		const t = alloc_page();
+		poke64(table + idx * 8n, t | FLAG_TABLE);
+		return t;
+	}
+	return entry & addr_mask();
+}
+
+/**
+ * Returns the level-3 (page) table covering `va`, or 0 if absent and !create.
+ */
+function get_l3(root: bigint, va: bigint, create: boolean): bigint {
+	if (get_page_size() === 4096n) {
+		const l2 = next_table(root, lshr64(va, 30n) & 0x1ffn, create);
+		if (l2 === 0n) {
+			return 0n;
+		}
+		return next_table(l2, lshr64(va, 21n) & 0x1ffn, create);
+	}
+	return next_table(root, lshr64(va, root_shift()) & root_index_mask(), create);
+}
+
+function l3_index(va: bigint): bigint {
+	return lshr64(va, get_page_shift()) & (table_entries() - 1n);
+}
+
+// Bytes of VA covered by one L3 table
+function l3_coverage(): bigint {
+	return table_entries() * get_page_size();
+}
+
+/**
+ * Installs an L3 page descriptor in `root` for `va`.
+ */
+function map_in(root: bigint, va: bigint, pa: bigint, attrs: u64): void {
+	const l3 = get_l3(root, va, true);
+	poke64(l3 + l3_index(va) * 8n, (pa & addr_mask()) | attrs);
+
+	dsb_ish();
+	isb();
+	tlbi_va(va);
+	dsb_ish();
+	isb();
+}
+
+function device_attrs(): u64 {
+	return FLAG_PAGE | FLAG_AF | FLAG_UXN | FLAG_PXN | shl64(ATTR_DEVICE, 2n);
+}
 
 /**
  * Maps a single virtual page to a physical frame for kernel usage.
  */
 export function map_page(va: bigint, pa: bigint, is_device: boolean): void {
-	if (config.use_16k) {
-		const l2_idx = lshr64(va, 25n) & 0x7ffn;
-		const l3_idx = lshr64(va, 14n) & 0x7ffn;
-
-		let l2_entry = peek64(root_table + l2_idx * 8n);
-		let l3_table: bigint = 0n;
-		if ((l2_entry & 1n) === 0n) {
-			l3_table = alloc_page();
-			poke64(root_table + l2_idx * 8n, l3_table | FLAG_TABLE);
-		} else {
-			l3_table = l2_entry & ~0x3fffn;
-		}
-
-		let attrs: u64 = FLAG_PAGE | FLAG_AF;
-		if (is_device) {
-			attrs = attrs | shl64(ATTR_DEVICE, 2n) | FLAG_UXN | FLAG_PXN;
-		} else {
-			attrs = attrs | shl64(ATTR_NORMAL, 2n) | FLAG_SH_INNER;
-		}
-		poke64(l3_table + l3_idx * 8n, (pa & ~0x3fffn) | attrs);
-
-		dsb_ish();
-		isb();
-		tlbi_va(lshr64(va, 14n));
-		dsb_ish();
-		isb();
+	let attrs: u64 = FLAG_PAGE | FLAG_AF;
+	if (is_device) {
+		attrs = attrs | shl64(ATTR_DEVICE, 2n) | FLAG_UXN | FLAG_PXN;
 	} else {
-		const l1_idx = lshr64(va, 30n) & 0x1ffn;
-		const l2_idx = lshr64(va, 21n) & 0x1ffn;
-		const l3_idx = lshr64(va, 12n) & 0x1ffn;
-
-		const l1_entry = peek64(root_table + l1_idx * 8n);
-		let l2_table: bigint = 0n;
-		if ((l1_entry & 1n) === 0n) {
-			l2_table = alloc_page();
-			poke64(root_table + l1_idx * 8n, l2_table | FLAG_TABLE);
-		} else {
-			l2_table = l1_entry & ~0xfffn;
-		}
-
-		const l2_entry = peek64(l2_table + l2_idx * 8n);
-		let l3_table: bigint = 0n;
-		if ((l2_entry & 1n) === 0n) {
-			l3_table = alloc_page();
-			poke64(l2_table + l2_idx * 8n, l3_table | FLAG_TABLE);
-		} else {
-			l3_table = l2_entry & ~0xfffn;
-		}
-
-		let attrs: u64 = FLAG_PAGE | FLAG_AF;
-		if (is_device) {
-			attrs = attrs | shl64(ATTR_DEVICE, 2n) | FLAG_UXN | FLAG_PXN;
-		} else {
-			attrs = attrs | shl64(ATTR_NORMAL, 2n) | FLAG_SH_INNER;
-		}
-		poke64(l3_table + l3_idx * 8n, (pa & ~0xfffn) | attrs);
-
-		dsb_ish();
-		isb();
-		tlbi_va(lshr64(va, 12n));
-		dsb_ish();
-		isb();
+		attrs = attrs | shl64(ATTR_NORMAL, 2n) | FLAG_SH_INNER;
 	}
+	map_in(root_table, va, pa, attrs);
+}
+
+/**
+ * Returns the physical page backing user `va` in the current address space,
+ * or 0 if unmapped.
+ */
+export function lookup_user_page(va: bigint): bigint {
+	const l3 = get_l3(current_root_table, va, false);
+	if (l3 === 0n) {
+		return 0n;
+	}
+	const entry = peek64(l3 + l3_index(va) * 8n);
+	if ((entry & 1n) === 0n) {
+		return 0n;
+	}
+	return entry & addr_mask();
 }
 
 /**
@@ -164,7 +235,7 @@ export function map_page(va: bigint, pa: bigint, is_device: boolean): void {
  * UXN: 0 if executable, 1 if non-executable (stack/data)
  * PXN: 1 (kernel cannot execute user pages)
  */
-function map_user_page(
+export function map_user_page(
 	va: bigint,
 	pa: bigint,
 	is_write: boolean,
@@ -186,133 +257,71 @@ function map_user_page(
 		attrs = attrs | FLAG_UXN;
 	}
 
-	if (config.use_16k) {
-		const l2_idx = lshr64(va, 25n) & 0x7ffn;
-		const l3_idx = lshr64(va, 14n) & 0x7ffn;
+	map_in(current_root_table, va, pa, attrs);
+}
 
-		let l2_entry = peek64(root_table + l2_idx * 8n);
-		let l3_table: bigint = 0n;
-		if ((l2_entry & 1n) === 0n) {
-			l3_table = alloc_page();
-			poke64(root_table + l2_idx * 8n, l3_table | FLAG_TABLE);
-		} else {
-			l3_table = l2_entry & ~0x3fffn;
-		}
+// --- Fixed mappings shared by every address space ---
 
-		poke64(l3_table + l3_idx * 8n, (pa & ~0x3fffn) | attrs);
-
-		dsb_ish();
-		isb();
-		tlbi_va(lshr64(va, 14n));
-		dsb_ish();
-		isb();
-	} else {
-		const l1_idx = lshr64(va, 30n) & 0x1ffn;
-		const l2_idx = lshr64(va, 21n) & 0x1ffn;
-		const l3_idx = lshr64(va, 12n) & 0x1ffn;
-
-		const l1_entry = peek64(current_root_table + l1_idx * 8n);
-		let l2_table: bigint = 0n;
-		if ((l1_entry & 1n) === 0n) {
-			l2_table = alloc_page();
-			poke64(current_root_table + l1_idx * 8n, l2_table | FLAG_TABLE);
-		} else {
-			l2_table = l1_entry & ~0xfffn;
-		}
-
-		const l2_entry = peek64(l2_table + l2_idx * 8n);
-		let l3_table: bigint = 0n;
-		if ((l2_entry & 1n) === 0n) {
-			l3_table = alloc_page();
-			poke64(l2_table + l2_idx * 8n, l3_table | FLAG_TABLE);
-		} else {
-			l3_table = l2_entry & ~0xfffn;
-		}
-
-		poke64(l3_table + l3_idx * 8n, (pa & ~0xfffn) | attrs);
-
-		dsb_ish();
-		isb();
-		tlbi_va(lshr64(va, 12n));
-		dsb_ish();
-		isb();
+/**
+ * Maps [1GB, 2GB) of RAM as normal memory using blocks at the root level
+ * (1GB for 4KB, 32MB for 16KB, 512MB for 64KB granules).
+ */
+function map_ram_blocks(root: bigint): void {
+	const shift = root_shift();
+	const block = shl64(1n, shift);
+	const attrs = FLAG_AF | FLAG_SH_INNER | shl64(ATTR_NORMAL, 2n) | 0x1n;
+	for (let pa = 0x40000000n; pa < 0x80000000n; pa = pa + block) {
+		poke64(root + lshr64(pa, shift) * 8n, pa | attrs);
 	}
+}
+
+function map_device_range(root: bigint, base: bigint, size: bigint): void {
+	const start = base & ~get_page_mask();
+	const end = (base + size + get_page_mask()) & ~get_page_mask();
+	for (let pa = start; pa < end; pa = pa + get_page_size()) {
+		map_in(root, pa, pa, device_attrs());
+	}
+}
+
+/**
+ * Identity-maps MMIO with individual pages so that user mappings can live
+ * in the same low region regardless of granule size.
+ */
+function map_devices(root: bigint): void {
+	map_device_range(root, 0x08000000n, 0x10000n); // GICv3 distributor
+	map_device_range(root, 0x080a0000n, 0x20000n); // GICv3 redistributor (RD + SGI)
+	map_device_range(root, 0x09000000n, 0x1000n); // PL011 UART
+	map_device_range(root, 0x0a000000n, 0x4000n); // VirtIO MMIO (32 slots)
 }
 
 /**
  * Initializes the MMU with identity mappings and prepares user space translation.
  */
-function init_mmu(): void {
+export function init_mmu(): void {
 	init_allocator();
 	root_table = alloc_page();
+	map_ram_blocks(root_table);
+	map_devices(root_table);
 
-	if (config.use_16k) {
-		// 16KB Granule: Root table is Level 2 (2048 entries of 32MB blocks)
-		// Block 0 [0..32MB): Left for L3 tables (user space ELFs at 0x200000 = 2MB)
-		// Blocks 1..31 [32MB..1GB): Device MMIO
-		for (let i = 1n; i < 32n; i = i + 1n) {
-			const pa = i * 0x02000000n;
-			const entry =
-				pa | FLAG_AF | FLAG_UXN | FLAG_PXN | shl64(ATTR_DEVICE, 2n) | 0x1n;
-			poke64(root_table + i * 8n, entry);
-		}
-		// Blocks 32..63 [1GB..2GB): Normal RAM (Kernel space)
-		for (let i = 32n; i < 64n; i = i + 1n) {
-			const pa = i * 0x02000000n;
-			const entry =
-				pa | FLAG_AF | FLAG_SH_INNER | shl64(ATTR_NORMAL, 2n) | 0x1n;
-			poke64(root_table + i * 8n, entry);
-		}
-
-		const tcr = (2n << 32n) | (1n << 23n) | (2n << 14n) | (3n << 12n) | 28n;
-		write_tcr_el1(tcr);
-	} else {
-		// 4KB Granule: Root table is Level 1 (512 entries of 1GB blocks)
-		// Entry 0 (0..1GB): Point to an L2 table so we can separate MMIO and Userspace!
-		const l2_table_0 = alloc_page();
-		poke64(root_table + 0n * 8n, l2_table_0 | FLAG_TABLE);
-
-		// In l2_table_0 (each entry maps 2MB):
-		// Map GIC (0x08000000 >> 21 = 64) as 2MB Device block
-		poke64(
-			l2_table_0 + 64n * 8n,
-			0x08000000n |
-				FLAG_UXN |
-				FLAG_PXN |
-				FLAG_AF |
-				shl64(ATTR_DEVICE, 2n) |
-				0x1n,
-		);
-		// Map UART (0x09000000 >> 21 = 72) as 2MB Device block
-		poke64(
-			l2_table_0 + 72n * 8n,
-			0x09000000n |
-				FLAG_UXN |
-				FLAG_PXN |
-				FLAG_AF |
-				shl64(ATTR_DEVICE, 2n) |
-				0x1n,
-		);
-		// Map VirtIO MMIO (0x0a000000 >> 21 = 80) as 2MB Device block
-		poke64(
-			l2_table_0 + 80n * 8n,
-			0x0a000000n |
-				FLAG_UXN |
-				FLAG_PXN |
-				FLAG_AF |
-				shl64(ATTR_DEVICE, 2n) |
-				0x1n,
-		);
-
-		// Entry 1 (1GB..2GB): 1GB Normal RAM block (Kernel code, data, stack, heap)
-		poke64(
-			root_table + 1n * 8n,
-			0x40000000n | FLAG_AF | FLAG_SH_INNER | shl64(ATTR_NORMAL, 2n) | 0x1n,
-		);
-
-		const tcr = (2n << 32n) | (1n << 23n) | (0n << 14n) | (3n << 12n) | 25n;
-		write_tcr_el1(tcr);
+	// TCR_EL1: IPS=40-bit, EPD1=1, TG0, SH0=inner, ORGN0/IRGN0=WB WA, T0SZ
+	let tg0: bigint = 0n; // 4KB
+	let t0sz: bigint = 25n; // 39-bit VA
+	if (get_page_size() === 16384n) {
+		tg0 = 2n;
+		t0sz = 28n; // 36-bit VA
+	} else if (get_page_size() === 65536n) {
+		tg0 = 1n;
+		t0sz = 28n; // 36-bit VA
 	}
+	const tcr =
+		(2n << 32n) |
+		(1n << 23n) |
+		(tg0 << 14n) |
+		(3n << 12n) |
+		(1n << 10n) |
+		(1n << 8n) |
+		t0sz;
+	write_tcr_el1(tcr);
 
 	// MAIR_EL1: Attr0 = Device-nGnRnE (0x00), Attr1 = Normal Cacheable (0xFF)
 	write_mair_el1(0x000000000000ff00n);
@@ -347,63 +356,39 @@ export function switch_user_root_table(new_root: bigint): void {
 
 export function create_user_root_table(): bigint {
 	const new_root = alloc_page();
-	const new_l2_0 = alloc_page();
-
-	// Entry 0 -> new_l2_0
-	poke64(new_root + 0n, new_l2_0 | FLAG_TABLE);
-
-	// Entry 1 -> 1GB Kernel RAM (0x40000000)
-	poke64(
-		new_root + 8n,
-		0x40000000n | FLAG_AF | FLAG_SH_INNER | shl64(ATTR_NORMAL, 2n) | 0x1n,
-	);
-
-	// Copy MMIO device blocks:
-	// GIC (0x08000000 >> 21 = 64)
-	poke64(new_l2_0 + 64n * 8n, 0x08000000n | FLAG_UXN | FLAG_PXN | FLAG_AF | shl64(ATTR_DEVICE, 2n) | 0x1n);
-	// UART (0x09000000 >> 21 = 72)
-	poke64(new_l2_0 + 72n * 8n, 0x09000000n | FLAG_UXN | FLAG_PXN | FLAG_AF | shl64(ATTR_DEVICE, 2n) | 0x1n);
-	// VirtIO (0x0a000000 >> 21 = 80)
-	poke64(new_l2_0 + 80n * 8n, 0x0a000000n | FLAG_UXN | FLAG_PXN | FLAG_AF | shl64(ATTR_DEVICE, 2n) | 0x1n);
-
+	map_ram_blocks(new_root);
+	map_devices(new_root);
 	return new_root;
 }
 
+/**
+ * Deep-copies every EL0-accessible page of `parent_root` into a new address
+ * space. User VA space is [0, 1GB); kernel RAM and MMIO are shared mappings.
+ */
 export function clone_user_address_space(parent_root: bigint): bigint {
 	const child_root = create_user_root_table();
-	const parent_l2_0 = peek64(parent_root + 0n) & ~0xfffn;
-	const child_l2_0  = peek64(child_root + 0n) & ~0xfffn;
+	const coverage = l3_coverage();
+	const entries = table_entries();
+	const words = get_page_size() / 8n;
 
-	// Iterate through all 512 entries of parent_l2_0
-	for (let e = 0n; e < 512n; e = e + 1n) {
-		// Skip kernel MMIO blocks: 64, 72, 80
-		if (e === 64n || e === 72n || e === 80n) {
+	for (let base = 0n; base < 0x40000000n; base = base + coverage) {
+		const parent_l3 = get_l3(parent_root, base, false);
+		if (parent_l3 === 0n) {
 			continue;
 		}
-
-		const l2_entry = peek64(parent_l2_0 + e * 8n);
-		// If entry is valid table (FLAG_TABLE = 3)
-		if ((l2_entry & 1n) !== 0n && (l2_entry & 2n) !== 0n) {
-			const parent_l3 = l2_entry & ~0xfffn;
-			const child_l3  = alloc_page();
-			poke64(child_l2_0 + e * 8n, child_l3 | FLAG_TABLE);
-
-			// Copy all valid 4KB user pages in this L3 table
-			for (let i = 0n; i < 512n; i = i + 1n) {
-				const l3_entry = peek64(parent_l3 + i * 8n);
-				if ((l3_entry & 1n) !== 0n) {
-					const parent_pa = l3_entry & ~0xfffn;
-					const attrs = l3_entry & 0xfffn;
-					const child_pa = alloc_page();
-
-					// Deep copy 4096 bytes
-					for (let k = 0n; k < 512n; k = k + 1n) {
-						poke64(child_pa + k * 8n, peek64(parent_pa + k * 8n));
-					}
-
-					poke64(child_l3 + i * 8n, child_pa | attrs);
-				}
+		for (let i = 0n; i < entries; i = i + 1n) {
+			const l3_entry = peek64(parent_l3 + i * 8n);
+			// Valid, EL0-accessible pages only (skips MMIO mappings)
+			if ((l3_entry & 1n) === 0n || (l3_entry & FLAG_AP_EL0) === 0n) {
+				continue;
 			}
+			const parent_pa = l3_entry & addr_mask();
+			const attrs = l3_entry & ~addr_mask();
+			const child_pa = alloc_page();
+			for (let k = 0n; k < words; k = k + 1n) {
+				poke64(child_pa + k * 8n, peek64(parent_pa + k * 8n));
+			}
+			map_in(child_root, base + i * get_page_size(), child_pa, attrs);
 		}
 	}
 

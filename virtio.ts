@@ -13,7 +13,7 @@ import {
     shl64,
     lshr64,
 } from "./uart.ts";
-import { alloc_page, dsb_ish } from "./mmu.ts";
+import { alloc_page, dsb_ish, get_page_size } from "./mmu.ts";
 const VIRTIO_MMIO_MAGIC_VALUE         = 0x000n; // 0x74726976
 const VIRTIO_MMIO_VERSION             = 0x004n; // 1 = legacy, 2 = modern
 const VIRTIO_MMIO_DEVICE_ID           = 0x008n; // 2 = block
@@ -145,8 +145,13 @@ export function virtio_blk_init(): boolean {
     // Allocate memory for virtqueue structures
     // Page 0: Descriptors (0..255) + Avail Ring (256..293)
     // Page 1: Used Ring (4096..4231) + Req Header (4256) + Req Status (4280) + Bounce Buffer
+    // The legacy layout (QueueAlign = 4096) places the used ring 4096 bytes
+    // after the descriptor table, so "page 1" is a 4KB offset, not a granule.
     queue_page = alloc_page();
-    const queue_page_1 = alloc_page();
+    if (get_page_size() === 4096n) {
+        alloc_page();
+    }
+    const queue_page_1 = queue_page + 4096n;
 
     desc_table = queue_page;
     avail_ring = queue_page + 256n;
@@ -155,11 +160,7 @@ export function virtio_blk_init(): boolean {
     req_status = queue_page_1 + 288n;
     bounce_buf = queue_page_1 + 512n;
 
-    // Zero out both pages
-    for (let i = 0n; i < 512n; i = i + 1n) {
-        poke64(queue_page + i * 8n, 0n);
-        poke64(queue_page_1 + i * 8n, 0n);
-    }
+    // (alloc_page already returns zeroed memory)
 
     if (version === (1 as u32)) {
         // Legacy MMIO: write GuestPageSize (0x028), QueueAlign (0x03c) and QueuePFN (0x040)
