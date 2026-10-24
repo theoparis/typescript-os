@@ -1,0 +1,17 @@
+{
+  "name": "ts2c",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun run src/cli.ts",
+    "test": "bun run test/run.ts"
+  },
+  "dependencies": {
+    "typescript": "5.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "bun-types": "^1.4.4"
+  }
+}
